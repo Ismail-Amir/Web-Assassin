@@ -1,12 +1,11 @@
 // ==UserScript==
-// @name        v4 test
+// @name        7
 // @namespace   Violentmonkey Scripts
-// @match       *://example.org/*
+// @match       *://*/*
+// @include     file:///*
 // @grant       none
 // @version     1.0
 // @author      -
-// @match        *://*/*
-// @include      file:///*
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @grant        GM.deleteValue
@@ -16,84 +15,198 @@
 // @grant        GM.addValueChangeListener
 // ==/UserScript==
 
+(() => {
+    /**
+     * Web Assassin UI IIFE
+     * - Exposes initUI() on window as window.webAssassinInitUI
+     * - Immediately bootstraps a single instance (window.webAssassinUI)
+     * - All UI is inside a shadow root to avoid CSS collisions
+     *
+     * Key public events:
+     * - window.dispatchEvent(new CustomEvent('web-assassin:refresh-engine'))
+     * - window.dispatchEvent(new CustomEvent('web-assassin:settings-changed', { detail: settings }))
+     * - UI listens for deletion events via window.addEventListener('web-assassin:deleted-element', ...)
+     *
+     * NOTE: This file includes placeholder/developer hooks for the deletion engine which should be implemented later.
+     */
 
-(async function () {
-    'use strict';
-
-    /* -----------------------
-       CONFIG & DEFAULTS
-    ------------------------*/
-    const SETTINGS_DEFAULTS = {
-        debug_mode: false,
-        accent_color: 'darkblue',
-        theme_mode: 'light',
-        notifications_active: true,
-        ui_language: 'en',
-        disable_script: false,
-        disable_script_websites: "", // comma-separated domains to globally disable on
-        deletion_rules: "",         // single GM key containing JSON array of rules
-        mutation_debounce_interval: 250,
-        url_debounce_interval: 1000,
-        url_periodic_check: true,
-        url_periodic_check_interval: 1000,
+    // ----------------------
+    // Defaults & schema
+    // ----------------------
+    const DEFAULT_SETTINGS = {
+        theme: {
+            mode: "light",
+            light: {
+                accent: "#5a8ead",
+                background: "#ffffff",
+                background2: "#f8fafc",
+                background3: "#b0b6bb",
+                foreground: "#0f172a",
+                glass: "var(--vm-border)",
+                border: "rgba(0,0,0,0.08)",
+            },
+            dark: {
+                accent: "#4144be",
+                background: "#0b1220",
+                background2: "#111827",
+                background3: "#1f2937",
+                foreground: "#e6eef8",
+                glass: "rgba(255,255,255,0.03)",
+                border: "rgba(255,255,255,0.08)",
+            },
+            rounded: "12px",
+            // modern, good-looking UI font stored under theme.font
+            font: 'Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+        },
+        toastsEnabled: true,
+        statsEnabled: false,
+        ui: {
+            lastTab: "rules",
+            language: "en",
+        },
+        deletionSettings: {
+            scriptDisabled: false,
+            mutationObserverDebounceInterval: 250,
+            peridoicURLCheck: false,
+            peridoicURLCheckInterval: 5000,
+            peridoicURLMutationDebounce: 250,
+            deletionRules: [
+                // sample rules left empty on init
+            ],
+            url_debounce_interval: 1000,
+            temporaryDeletionMin: 500,
+            temporaryDeletionMax: 3000,
+        },
+        // storage for aggregated totals if needed outside per-rule counters
+        statistics: {},
     };
-    const INIT_FLAG_KEY = "__settings_initialized__";
 
-    // Runtime config (does not include deletion_rules bulk by default)
-    let CONFIG = {};
-    let debug = false;
+    const GM_KEY = "web_assassin_settings";
 
-    // Runtime state
-    const state = {
-        // observers (MutationObservers)
-        observers: [],
-        // url watcher interval id
-        urlWatcherId: null,
-        // last seen url
-        lastUrl: '',
-        // pending nodes queues for observers
-        pendingForever: new Set(),
-        pendingOnce: new Set(),
-        // processors (debounced)
-        processForeverDebounced: null,
-        processOnceDebounced: null,
-        // currently active selector lists (normalized objects)
-        foreverList: [],
-        onceList: [],
-        // concurrency guard
-        isRunning: false,
-        // for cleaning up history patch & listeners
-        _historyPatched: false,
-        _originalHistory: {},
-        _urlListeners: [],
-        // small mutation observers used for SPA detection (when periodic off)
-        _spaObservers: []
-    };
+    // ----------------------
+    // GM storage wrappers (fall back to localStorage for dev/testing)
+    // ----------------------
+    async function gmGet(key, fallback = null) {
+        try {
+            if (typeof GM?.getValue === "function") {
+                return await GM.getValue(key, fallback);
+            }
+            // Violentmonkey/others may expose GM.getValue as promise; ignore for now.
+            if (typeof GM?.getValue === "function") {
+                return await GM.getValue(key, fallback);
+            }
 
-    // Global deletion counters (UI can read these)
-    window.__vm_deletedOnceCount = 0;
-    window.__vm_deletedForeverCount = 0;
-    window.__vm_getDeletedCounts = () => ({ once: window.__vm_deletedOnceCount, forever: window.__vm_deletedForeverCount });
-
-    /* -----------------------
-       UTILITIES
-    ------------------------*/
-    function debugLog(...args) {
-        if (debug) console.debug('[🪲 DEBUG]', ...args);
+        } catch (e) {
+            // ignore and fallback
+        }
+        try {
+            const raw = localStorage.getItem(key);
+            return raw ? JSON.parse(raw) : fallback;
+        } catch (e) {
+            return fallback;
+        }
     }
 
-    function debounce(fn, delay) {
-        let tid = null;
-        return (...args) => {
-            if (tid) clearTimeout(tid);
-            tid = setTimeout(() => {
-                tid = null;
-                try { fn(...args); } catch (e) { console.error(e); }
-            }, delay);
-        };
+    async function gmSet(key, value) {
+        try {
+            if (typeof GM?.setValue === "function") {
+                await GM.setValue(key, value);
+                return;
+            }
+        } catch (e) {
+            // fallback
+        }
+        try {
+            localStorage.setItem(key, JSON.stringify(value));
+        } catch (e) {
+            console.warn("Failed to persist settings to localStorage", e);
+        }
     }
 
-    // Domain matching helper: supports wildcard *.example.com or plain substring/hostname checks
+    // ----------------------
+    // Utilities (domain parsing, id gen, CSS generation)
+    // ----------------------
+    function getDomain(URLInput) {
+        // --- Helpers Extracted from Original Function ---
+
+        // Helper to validate if a string is a standard IPv4 address.
+        function isValidIpAddress(str) {
+            return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(str);
+        }
+
+        // Helper to normalize file path strings (e.g., "file:///C:/..." or "C:\...").
+        function normalizeFilePath(path) {
+            let n = String(path).toLowerCase();
+            // Strip "file:" protocol prefix and leading slashes
+            if (n.startsWith("file:")) {
+                n = n.replace(/^file:(\/+)?/, "");
+            }
+            // Handle Windows-style paths that might start with a slash (e.g., /C:/...)
+            if (n.startsWith("/") && n[2] === ":") {
+                n = n.slice(1);
+            }
+            // Unify path separators to forward slashes
+            return n.replace(/\\/g, "/");
+        }
+
+        // --- Main Logic ---
+
+        if (!URLInput) {
+            return "";
+        }
+
+        const inputStr = String(URLInput).trim();
+
+        // First, try to treat the input as a full URL.
+        try {
+            const url = new URL(inputStr);
+
+            // Case 1: The URL is a file path.
+            if (url.protocol === "file:") {
+                // Use the dedicated file path normalizer on the original string,
+                // as URL parsing can sometimes alter it.
+                return normalizeFilePath(inputStr);
+            }
+
+            // Case 2: It's a standard web URL (http, https, etc.).
+            let hostname = url.hostname.toLowerCase();
+
+            // Normalize IPv6 addresses by removing brackets.
+            if (hostname.startsWith("[") && hostname.endsWith("]")) {
+                hostname = hostname.slice(1, -1);
+            }
+            return hostname;
+
+        } catch {
+            // If new URL() fails, the input is not a full, valid URL.
+            // It could be a bare domain, IP address, or local file path string.
+            const candidate = inputStr.toLowerCase();
+
+            // The part of the string before a colon, for checking IPs like "127.0.0.1:8080".
+            const baseCandidate = candidate.split(":")[0];
+
+            // Case 3: It's an IP address (with or without a port).
+            if (isValidIpAddress(baseCandidate)) {
+                return baseCandidate; // Return only the IP part.
+            }
+
+            // Case 4: It's a file path string (e.g., "C:\Users\...").
+            // The presence of a colon (after the IP check fails) or backslashes
+            // is a strong indicator of a Windows file path.
+            if (candidate.includes(":") || candidate.includes("\\")) {
+                return normalizeFilePath(candidate);
+            }
+
+            // Case 5: It's a bare domain or hostname. Return it as is (trimmed and lowercased).
+            // Note: A domain with a path like 'example.com/foo' will fall through to here.
+            // The original function's logic only stripped the path from the 'domainOfRule',
+            // not 'pageDomain' in this scenario, so we return the full candidate.
+            return candidate.split("/")[0];
+        }
+    }
+
+
+    // Domain matching: wildcard if ruleDomain contains '*', otherwise exact
     function domainMatches(domainOfRule, pageDomain) {
 
         // --- Helpers ---------------------------------------------------------------
@@ -227,1634 +340,2900 @@
         return false;
     }
 
-    // Normalize a selector item to object { selector, name, ruleId, ruleName }
-    function normalizeSelectorItem(item, rule = {}) {
-        if (!item) return null;
-        const selector = (typeof item === 'string') ? item : item.selector;
-        if (!selector || typeof selector !== 'string') return null;
-        const name = (item && item.name) ? item.name : selector;
+    function genId(prefix = "rule") {
+        const rnd = Math.random().toString(36).slice(2, 9);
+        return `${prefix}-${Date.now().toString(36)}-${rnd}`;
+    }
+
+    function normalizeSelectorString(s) {
+        if (!s) return "";
+        return s.trim().replace(/\s+/g, " ");
+    }
+
+    function generateCssSelector(el) {
+        // Robust, but simple generator:
+        // - If element has ID and it's unique in document -> use #id
+        // - else build path with tag + classes and nth-of-type as necessary
+        if (!el || el.nodeType !== 1) return "";
+        const doc = document;
+        if (el.id) {
+            const query = `#${CSS.escape(el.id)}`;
+            try {
+                const found = doc.querySelectorAll(query);
+                if (found.length === 1) return query;
+            } catch (e) {
+                // ignore
+            }
+        }
+
+        // build path of up to 5 segments
+        const parts = [];
+        let node = el;
+        for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth++, node = node.parentElement) {
+            let part = node.tagName.toLowerCase();
+            if (node.classList && node.classList.length) {
+                // take only first two classes to keep selector readable
+                const cls = Array.from(node.classList).slice(0, 2).map((c) => "." + CSS.escape(c)).join("");
+                part += cls;
+            }
+            // nth-of-type fallback for uniqueness
+            try {
+                const siblings = node.parentElement ? Array.from(node.parentElement.children).filter((c) => c.tagName === node.tagName) : [];
+                if (siblings.length > 1) {
+                    const idx = siblings.indexOf(node) + 1;
+                    part += `:nth-of-type(${idx})`;
+                }
+            } catch (e) { }
+            parts.unshift(part);
+            try {
+                const sel = parts.join(" > ");
+                if (doc.querySelectorAll(sel).length === 1) return sel;
+            } catch (e) { }
+        }
+        // fallback to tag.class path
+        try {
+            const fallback = parts.join(" > ");
+            if (fallback) return fallback;
+        } catch (e) { }
+        // ultimate fallback
+        try {
+            return el.tagName.toLowerCase();
+        } catch (e) {
+            return "";
+        }
+    }
+
+    // ----------------------
+    // Rule management core (isolated module)
+    // ----------------------
+    function RuleManager(initialSettings) {
+        // state
+        let settings = initialSettings || JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+        // ensure certain paths exist
+        settings.deletionSettings = settings.deletionSettings || DEFAULT_SETTINGS.deletionSettings;
+        settings.deletionSettings.deletionRules = settings.deletionSettings.deletionRules || [];
+
+        function getAllRules() {
+            return settings.deletionSettings.deletionRules;
+        }
+
+        function findRuleByDomain(domainOrUrl) {
+            const target = getDomain(domainOrUrl);
+            if (!target) return null;
+            return getAllRules().find((r) => domainMatches(r.domain, target));
+        }
+
+        function findRuleByID(id) {
+            return getAllRules().find((r) => r.ID === id) || null;
+        }
+
+        function addRule(ruleObj) {
+            // assume ruleObj has domain; ensure unique ID
+            if (!ruleObj.ID) ruleObj.ID = genId("rule");
+            // ensure counters exist
+            ruleObj.tempDeleteCount = ruleObj.tempDeleteCount || 0;
+            ruleObj.permanentDeleteCount = ruleObj.permanentDeleteCount || 0;
+            // normalize selectors
+            ruleObj.tempSelectors = Array.isArray(ruleObj.tempSelectors) ? ruleObj.tempSelectors.map(normalizeSelectorItem) : [];
+            ruleObj.permanentSelectors = Array.isArray(ruleObj.permanentSelectors) ? ruleObj.permanentSelectors.map(normalizeSelectorItem) : [];
+
+            // ensure no duplicate selectors within this new rule
+            ruleObj.tempSelectors = dedupeSelectorsArray(ruleObj.tempSelectors);
+            ruleObj.permanentSelectors = dedupeSelectorsArray(ruleObj.permanentSelectors);
+
+            // Ensure a selector does not exist in both temp and permanent for the same rule.
+            // If a selector appears in both, prefer the permanent variant (store under perm only).
+            const permSet = new Set((ruleObj.permanentSelectors || []).map(it => normalizeSelectorString(it.selector)));
+            if (permSet.size) {
+                ruleObj.tempSelectors = (ruleObj.tempSelectors || []).filter(it => !permSet.has(normalizeSelectorString(it.selector)));
+            }
+
+            // IMPORTANT: ensure deletionRules key exists and mirrors selector arrays.
+            ruleObj.deletionRules = ruleObj.deletionRules || { enabled: true, temp: [], perm: [] };
+            ruleObj.deletionRules.enabled = (ruleObj.deletionRules.enabled !== false); // default true
+            ruleObj.deletionRules.temp = ruleObj.tempSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+            ruleObj.deletionRules.perm = ruleObj.permanentSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+
+            // Remove any selector collisions from other rules (merge semantics)
+            for (const it of ruleObj.tempSelectors) removeSelectorFromOtherRules(it.selector, ruleObj.ID);
+            for (const it of ruleObj.permanentSelectors) removeSelectorFromOtherRules(it.selector, ruleObj.ID);
+
+            settings.deletionSettings.deletionRules.push(ruleObj);
+            persist();
+            return ruleObj;
+        }
+
+        function normalizeSelectorItem(item) {
+            return {
+                name: item.name ? String(item.name) : "",
+                selector: normalizeSelectorString(item.selector || ""),
+            };
+        }
+
+        // Add dedupeSelectorsArray helper (was accidentally removed)
+        function dedupeSelectorsArray(arr) {
+            const seen = new Set();
+            const out = [];
+            for (const it of arr || []) {
+                const sel = normalizeSelectorString(it.selector);
+                if (!sel) continue;
+                if (seen.has(sel)) continue;
+                seen.add(sel);
+                out.push({ name: it.name || "", selector: sel });
+            }
+            return out;
+        }
+
+        // Remove a selector (normalized) from all rules except the optional excludeId
+        function removeSelectorFromOtherRules(selector, excludeId = null) {
+            const selNorm = normalizeSelectorString(selector);
+            if (!selNorm) return;
+            const rules = settings.deletionSettings.deletionRules || [];
+            let changed = false;
+            for (const r of rules) {
+                if (!r || !r.ID) continue;
+                if (excludeId && r.ID === excludeId) continue;
+                // remove from tempSelectors
+                if (Array.isArray(r.tempSelectors)) {
+                    const before = r.tempSelectors.length;
+                    r.tempSelectors = r.tempSelectors.filter((it) => normalizeSelectorString(it.selector) !== selNorm);
+                    if (r.tempSelectors.length !== before) changed = true;
+                }
+                // remove from permanentSelectors
+                if (Array.isArray(r.permanentSelectors)) {
+                    const before = r.permanentSelectors.length;
+                    r.permanentSelectors = r.permanentSelectors.filter((it) => normalizeSelectorString(it.selector) !== selNorm);
+                    if (r.permanentSelectors.length !== before) changed = true;
+                }
+                // keep deletionRules in sync if present
+                r.deletionRules = r.deletionRules || { enabled: true, temp: [], perm: [] };
+                r.deletionRules.temp = (r.tempSelectors || []).map(it => ({ name: it.name || "", selector: it.selector }));
+                r.deletionRules.perm = (r.permanentSelectors || []).map(it => ({ name: it.name || "", selector: it.selector }));
+            }
+            if (changed) persist();
+        }
+
+        function updateRuleByID(id, patchObj) {
+            const r = findRuleByID(id);
+            if (!r) return null;
+            // update allowed fields
+            r.name = patchObj.name !== undefined ? patchObj.name : r.name;
+            r.domain = patchObj.domain !== undefined ? patchObj.domain : r.domain;
+
+            // update selectors and keep deletionRules in sync
+            if (patchObj.tempSelectors) {
+                r.tempSelectors = patchObj.tempSelectors.map(normalizeSelectorItem);
+                // dedupe within the rule
+                r.tempSelectors = dedupeSelectorsArray(r.tempSelectors);
+                // remove these selectors from other rules (merge)
+                for (const it of r.tempSelectors) removeSelectorFromOtherRules(it.selector, r.ID);
+                // ensure these temp selectors are NOT present in this rule's permanentSelectors
+                const tempSet = new Set(r.tempSelectors.map(it => normalizeSelectorString(it.selector)));
+                if (Array.isArray(r.permanentSelectors)) {
+                    r.permanentSelectors = r.permanentSelectors.filter((it) => !tempSet.has(normalizeSelectorString(it.selector)));
+                }
+                r.deletionRules = r.deletionRules || { enabled: true, temp: [], perm: [] };
+                r.deletionRules.temp = r.tempSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+                r.deletionRules.perm = (r.permanentSelectors || []).map(it => ({ name: it.name || "", selector: it.selector }));
+            }
+            if (patchObj.permanentSelectors) {
+                r.permanentSelectors = patchObj.permanentSelectors.map(normalizeSelectorItem);
+                // dedupe within the rule
+                r.permanentSelectors = dedupeSelectorsArray(r.permanentSelectors);
+                // remove these selectors from other rules (merge)
+                for (const it of r.permanentSelectors) removeSelectorFromOtherRules(it.selector, r.ID);
+                // ensure these perm selectors are NOT present in this rule's tempSelectors
+                const permSet2 = new Set(r.permanentSelectors.map(it => normalizeSelectorString(it.selector)));
+                if (Array.isArray(r.tempSelectors)) {
+                    r.tempSelectors = r.tempSelectors.filter((it) => !permSet2.has(normalizeSelectorString(it.selector)));
+                }
+                r.deletionRules = r.deletionRules || { enabled: true, temp: [], perm: [] };
+                r.deletionRules.perm = r.permanentSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+                r.deletionRules.temp = (r.tempSelectors || []).map(it => ({ name: it.name || "", selector: it.selector }));
+            }
+
+            if (patchObj.ruleEnabled !== undefined) r.ruleEnabled = !!patchObj.ruleEnabled;
+
+            // allow toggling presence/enablement of deletionRules key (keeps key present)
+            if (patchObj.deletionRulesEnabled !== undefined) {
+                r.deletionRules = r.deletionRules || { enabled: true, temp: [], perm: [] };
+                r.deletionRules.enabled = !!patchObj.deletionRulesEnabled;
+            }
+
+            // counters: keep as-is unless provided explicitly
+            if (patchObj.tempDeleteCount !== undefined) r.tempDeleteCount = patchObj.tempDeleteCount;
+            if (patchObj.permanentDeleteCount !== undefined) r.permanentDeleteCount = patchObj.permanentDeleteCount;
+            persist();
+            return r;
+        }
+
+        function removeRuleByID(id) {
+            const idx = settings.deletionSettings.deletionRules.findIndex((r) => r.ID === id);
+            if (idx === -1) return false;
+            settings.deletionSettings.deletionRules.splice(idx, 1);
+            persist();
+            return true;
+        }
+
+        function incrementCounter(ruleID, mode = "temp", amount = 1) {
+            const r = findRuleByID(ruleID);
+            if (!r) return;
+            if (mode === "temp") r.tempDeleteCount = (r.tempDeleteCount || 0) + amount;
+            else r.permanentDeleteCount = (r.permanentDeleteCount || 0) + amount;
+            persist();
+        }
+
+        function persist() {
+            gmSet(GM_KEY, settings);
+            // notify
+            window.dispatchEvent(new CustomEvent("web-assassin:settings-changed", { detail: settings }));
+        }
+
+        function setSettings(newSettings) {
+            settings = newSettings;
+            // normalize missing fields
+            settings.deletionSettings = settings.deletionSettings || DEFAULT_SETTINGS.deletionSettings;
+            settings.deletionSettings.deletionRules = settings.deletionSettings.deletionRules || [];
+
+            // ensure theme and theme.font exist so UI can always read theme.font
+            settings.theme = settings.theme || {};
+            settings.theme.mode = settings.theme.mode || DEFAULT_SETTINGS.theme.mode;
+            settings.theme.light = settings.theme.light || DEFAULT_SETTINGS.theme.light;
+            settings.theme.dark = settings.theme.dark || DEFAULT_SETTINGS.theme.dark;
+            settings.theme.rounded = settings.theme.rounded || DEFAULT_SETTINGS.theme.rounded;
+            settings.theme.font = settings.theme.font || DEFAULT_SETTINGS.theme.font;
+
+            persist();
+        }
+
+        function getSettings() {
+            return settings;
+        }
+
+        function mergeRules(savedRule, unsavedRule) {
+            // Merge semantics per your spec:
+            // - Append new unique elements (by selector string) from unsaved to saved
+            // - If a selector exists in saved (either temp or permanent) and also in unsaved, remove old and replace with the version from unsaved
+            // - Ignore counters (do not change saved counters)
+            const s = savedRule;
+            const u = unsavedRule;
+
+            const existingSelectors = new Set();
+            s.tempSelectors.forEach((it) => existingSelectors.add(normalizeSelectorString(it.selector)));
+            s.permanentSelectors.forEach((it) => existingSelectors.add(normalizeSelectorString(it.selector)));
+
+            // helper to remove selector string from saved arrays
+            function removeFromSaved(selectorStr) {
+                selectorStr = normalizeSelectorString(selectorStr);
+                s.tempSelectors = s.tempSelectors.filter((it) => normalizeSelectorString(it.selector) !== selectorStr);
+                s.permanentSelectors = s.permanentSelectors.filter((it) => normalizeSelectorString(it.selector) !== selectorStr);
+            }
+
+            // replace or append temp
+            (u.tempSelectors || []).forEach((it) => {
+                const sel = normalizeSelectorString(it.selector);
+                if (!sel) return;
+                // if exists in saved, remove old and append new
+                removeFromSaved(sel);
+                s.tempSelectors.push(normalizeSelectorItem(it));
+            });
+
+            (u.permanentSelectors || []).forEach((it) => {
+                const sel = normalizeSelectorString(it.selector);
+                if (!sel) return;
+                removeFromSaved(sel);
+                s.permanentSelectors.push(normalizeSelectorItem(it));
+            });
+
+            // ensure no duplicates within saved arrays
+            s.tempSelectors = dedupeSelectorsArray(s.tempSelectors);
+            s.permanentSelectors = dedupeSelectorsArray(s.permanentSelectors);
+
+            // Keep deletionRules in sync and always present
+            s.deletionRules = s.deletionRules || { enabled: true, temp: [], perm: [] };
+            s.deletionRules.enabled = (s.deletionRules.enabled !== false);
+            s.deletionRules.temp = s.tempSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+            s.deletionRules.perm = s.permanentSelectors.map(it => ({ name: it.name || "", selector: it.selector }));
+
+            persist();
+            return s;
+        }
+
+        function saveRule(unsavedRule, mode = "add") {
+            if (!unsavedRule) {
+                return { status: "error", message: "No rule to save." };
+            }
+
+            // --- Normalize & Validate ---------------------------------------------
+
+            const domainClean = getDomain(unsavedRule.domain);
+            if (!domainClean) {
+                return { status: "error", message: "Please provide a valid domain for the rule." };
+            }
+
+            const temp = (unsavedRule.tempSelectors || [])
+                .map(normalizeSelectorItem)
+                .filter(it => it.selector);
+
+            const perm = (unsavedRule.permanentSelectors || [])
+                .map(normalizeSelectorItem)
+                .filter(it => it.selector);
+
+            // dedupe incoming selectors to avoid duplicate CSS within same rule
+            const tempD = dedupeSelectorsArray(temp);
+            const permD = dedupeSelectorsArray(perm);
+
+            if (temp.length + perm.length === 0) {
+                return { status: "error", message: "Please add at least one selector." };
+            }
+
+            // --- Check duplicates --------------------------------------------------
+
+            const existingByDomain = findRuleByDomain(domainClean);
+            const existingById = unsavedRule.ID ? findRuleByID(unsavedRule.ID) : null;
+
+            // ADD: domain duplication check
+            if (mode === "add" && existingByDomain) {
+                return {
+                    status: "duplicate",
+                    type: "domain",
+                    existingRule: existingByDomain,
+                    domain: domainClean
+                };
+            }
+
+            // EDIT: domain changed to match another rule
+            if (mode === "edit" && existingByDomain && existingByDomain.ID !== unsavedRule.ID) {
+                return {
+                    status: "duplicate",
+                    type: "domain",
+                    existingRule: existingByDomain,
+                    domain: domainClean
+                };
+            }
+
+            // --- Perform Save / Merge ----------------------------------------------
+
+            const deletionRulesEnabled = (unsavedRule.deletionRulesEnabled !== undefined) ? !!unsavedRule.deletionRulesEnabled : true;
+
+            if (mode === "add") {
+                const newRule = {
+                    ID: genId("rule"),
+                    name: unsavedRule.name || "",
+                    domain: domainClean,
+                    tempSelectors: tempD,
+                    permanentSelectors: permD,
+                    tempDeleteCount: 0,
+                    permanentDeleteCount: 0,
+                    ruleEnabled: unsavedRule.ruleEnabled !== false,
+                    // always include deletionRules key (enabled flag + arrays)
+                    deletionRules: {
+                        enabled: deletionRulesEnabled,
+                        temp: tempD.map(it => ({ name: it.name || "", selector: it.selector })),
+                        perm: permD.map(it => ({ name: it.name || "", selector: it.selector }))
+                    }
+                };
+                // remove selector collisions from other rules (merge semantics)
+                for (const it of newRule.tempSelectors) removeSelectorFromOtherRules(it.selector, newRule.ID);
+                for (const it of newRule.permanentSelectors) removeSelectorFromOtherRules(it.selector, newRule.ID);
+
+                addRule(newRule);
+
+                return { status: "added", rule: newRule };
+            }
+
+            if (mode === "edit") {
+                if (!existingById) {
+                    // fallback to add
+                    const newRule = {
+                        ID: genId("rule"),
+                        name: unsavedRule.name || "",
+                        domain: domainClean,
+                        tempSelectors: tempD,
+                        permanentSelectors: permD,
+                        tempDeleteCount: 0,
+                        permanentDeleteCount: 0,
+                        ruleEnabled: unsavedRule.ruleEnabled !== false,
+                        deletionRules: {
+                            enabled: deletionRulesEnabled,
+                            temp: tempD.map(it => ({ name: it.name || "", selector: it.selector })),
+                            perm: permD.map(it => ({ name: it.name || "", selector: it.selector }))
+                        }
+                    };
+                    for (const it of newRule.tempSelectors) removeSelectorFromOtherRules(it.selector, newRule.ID);
+                    for (const it of newRule.permanentSelectors) removeSelectorFromOtherRules(it.selector, newRule.ID);
+                    addRule(newRule);
+                    return { status: "added", rule: newRule };
+                }
+
+                // Update with deduped selectors; updateRuleByID will handle merge removal
+                updateRuleByID(existingById.ID, {
+                    name: unsavedRule.name,
+                    domain: domainClean,
+                    tempSelectors: tempD,
+                    permanentSelectors: permD,
+                    ruleEnabled: !!unsavedRule.ruleEnabled,
+                    deletionRulesEnabled: deletionRulesEnabled
+                });
+
+                return { status: "updated", rule: findRuleByID(existingById.ID) };
+            }
+
+            return { status: "error", message: "Unknown save mode." };
+        }
+
+
         return {
-            selector: selector.trim(),
-            name: String(name),
-            ruleId: rule.id || null,
-            ruleName: rule.name || null
+            getSettings,
+            setSettings,
+            getAllRules,
+            findRuleByDomain,
+            findRuleByID,
+            addRule,
+            updateRuleByID,
+            removeRuleByID,
+            incrementCounter,
+            persist,
+            mergeRules,
+            dedupeSelectorsArray,
+            saveRule,
         };
     }
 
-    // Deduplicate selectors by selector string
-    function dedupeSelectors(list) {
-        const map = new Map();
-        for (const s of list) {
-            if (!s || !s.selector) continue;
-            if (!map.has(s.selector)) map.set(s.selector, s);
+    // ----------------------
+    // Deletion Engine Module
+    // ----------------------
+    // Place this AFTER RuleManager(...) and BEFORE initUI()
+    function DeletionEngine(ruleManager) {
+        if (!ruleManager) throw new Error("DeletionEngine requires a ruleManager instance");
+
+        // internal state
+        let running = false;
+        let tempObserver = null;
+        let permObserver = null;
+        let urlObserversInstalled = false;
+        let periodicUrlTimer = null;
+        let lastUrl = location.href;
+        let tempStopTimer = null;
+        let tempStabilizeDebounce = null;
+        let permDebounceTimer = null;
+
+        // aggregated maps: selector -> Set(ruleId)
+        let tempSelectorMap = new Map();
+        let permSelectorMap = new Map();
+
+        // settings shortcut (read live from ruleManager)
+        function getCfg() {
+            const s = ruleManager.getSettings();
+            return (s && s.deletionSettings) ? s.deletionSettings : {};
         }
-        return Array.from(map.values());
-    }
 
-    // deleteElements: optimized combined selector with fallback per-selector; accepts normalized items or strings
-    // NOTE: We increment deletion counters here and try to attribute each removed node to once/forever where possible.
-    function deleteElements(selectors) {
-        if (!selectors || selectors.length === 0) return;
-        const valid = selectors.filter(s => s && (typeof s === 'string' || s.selector));
-        if (valid.length === 0) return;
+        // helpers
+        const doc = document;
+        function now() { return Date.now(); }
 
-        // Build quick lookup sets of once/forever selectors (strings)
-        const onceSet = new Set((state.onceList || []).map(s => s.selector));
-        const foreverSet = new Set((state.foreverList || []).map(s => s.selector));
+        function normalizeSel(sel) {
+            return normalizeSelectorString(sel || "");
+        }
 
-        // build combined selector if possible
-        const selectorStrings = valid.map(s => (typeof s === 'string') ? s : s.selector);
-        const combined = selectorStrings.join(', ');
-
-        try {
-            const nodes = document.querySelectorAll(combined);
-            if (nodes.length > 0) {
-                nodes.forEach(n => {
-                    try {
-                        // Try to attribute to once selectors first, then forever (cheap matches)
-                        let attributed = false;
-                        for (const sel of onceSet) {
-                            try {
-                                if (n.matches && n.matches(sel)) {
-                                    window.__vm_deletedOnceCount++;  // Keep the count updated
-                                    const deletedOnceEvent = new CustomEvent('vm-deleted-once', {
-                                        detail: {
-                                            ruleName: sel.ruleName,  // Pass rule name here
-                                            deletionType: 'once',    // Specify it's 'once'
-                                            count: window.__vm_deletedOnceCount,
-                                        }
-                                    });
-                                    window.dispatchEvent(deletedOnceEvent);
-                                    attributed = true;
-                                    break;
-                                }
-                            } catch (e) { /* ignore invalid sel */ }
-                        }
-
-                        if (!attributed) {
-                            for (const sel of foreverSet) {
-                                try {
-                                    if (n.matches && n.matches(sel)) {
-                                        window.__vm_deletedForeverCount++;  // Keep the count updated
-                                        const deletedForeverEvent = new CustomEvent('vm-deleted-forever', {
-                                            detail: {
-                                                ruleName: sel.ruleName,  // Pass rule name here
-                                                deletionType: 'forever', // Specify it's 'forever'
-                                                count: window.__vm_deletedForeverCount,
-                                            }
-                                        });
-                                        window.dispatchEvent(deletedForeverEvent);
-                                        attributed = true;
-                                        break;
-                                    }
-                                } catch (e) { /* ignore invalid sel */ }
-                            }
-                        }
-
-                        // If still not attributed, we won't guess — prefer not mis-attribute.
-                        n.remove();
-                    } catch (e) {
-                        // defensive: still remove if possible
-                        try { n.remove(); } catch (err) { }
-                    }
-                });
-                debugLog(`🗑️ [Optimized] Removed ${nodes.length} node(s) for ${valid.length} selectors.`);
+        function addToMap(map, selector, ruleId) {
+            const k = normalizeSel(selector);
+            if (!k) return;
+            let set = map.get(k);
+            if (!set) {
+                set = new Set();
+                map.set(k, set);
             }
-            return;
-        } catch (e) {
-            debugLog('⚠️ Combined selector failed, falling back to single selectors.', e && e.message);
-            for (let i = 0; i < valid.length; i++) {
-                const s = valid[i];
-                const sel = typeof s === 'string' ? s : s.selector;
-                const name = (typeof s === 'object' && s.name) ? s.name : sel;
-                try {
-                    const nodes = document.querySelectorAll(sel);
-                    if (nodes.length > 0) {
-                        nodes.forEach(n => {
-                            try { n.remove(); } catch (e) { }
-                        });
+            set.add(ruleId);
+        }
 
-                        // attribute based on which set the selector belongs to
-                        if (onceSet.has(sel)) {
-                            window.__vm_deletedOnceCount += nodes.length;
-                            const deletedOnceEvent = new CustomEvent('vm-deleted-once', {
-                                detail: {
-                                    ruleName: name,  // Pass rule name here
-                                    deletionType: 'once',  // Specify it's 'once'
-                                    count: window.__vm_deletedOnceCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedOnceEvent);
-                        } else if (foreverSet.has(sel)) {
-                            window.__vm_deletedForeverCount += nodes.length;
-                            const deletedForeverEvent = new CustomEvent('vm-deleted-forever', {
-                                detail: {
-                                    ruleName: name,  // Pass rule name here
-                                    deletionType: 'forever',  // Specify it's 'forever'
-                                    count: window.__vm_deletedForeverCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedForeverEvent);
-                        }
+        // Build aggregated selector maps from matched rules
+        function aggregateSelectorsForCurrentPage() {
+            tempSelectorMap.clear();
+            permSelectorMap.clear();
 
-                        debugLog(`🗑️ Removed ${nodes.length} node(s) for "${name}" — ${sel}`);
+            const settings = ruleManager.getSettings();
+            const rules = settings.deletionSettings?.deletionRules || [];
+            const pageDomain = location.href;
+
+            for (const r of rules) {
+                if (!r || !r.domain) continue;
+
+                // NEW: skip rules that are explicitly disabled
+                if (r.ruleEnabled === false) continue;
+
+                if (!domainMatches(r.domain, pageDomain)) continue;
+
+                // temp selectors
+                (r.tempSelectors || []).forEach(it => {
+                    const sel = normalizeSel(it.selector || "");
+                    if (!sel) return;
+                    addToMap(tempSelectorMap, sel, r.ID);
+                });
+
+                // perm selectors
+                (r.permanentSelectors || []).forEach(it => {
+                    const sel = normalizeSel(it.selector || "");
+                    if (!sel) return;
+                    addToMap(permSelectorMap, sel, r.ID);
+                });
+            }
+
+            return {
+                tempSelectors: Array.from(tempSelectorMap.keys()),
+                permSelectors: Array.from(permSelectorMap.keys()),
+            };
+        }
+
+        // Convenience: turn a selector map into array of { selector, ruleIds: [...ids] }
+        function selectorMapToArray(map) {
+            return Array.from(map.entries()).map(([selector, set]) => ({ selector, ruleIds: Array.from(set) }));
+        }
+
+        // Emit deletion event and increment counters via ruleManager.
+        // countsByRule: Map(ruleId -> count)
+        function handleDeletionCounts(countsByRule, type) {
+            const s = ruleManager.getSettings();
+            const statsEnabled = !!s?.statsEnabled;
+
+            if (!statsEnabled) return;
+            for (const [ruleId, count] of countsByRule.entries()) {
+                // Only update persistent counters if statsEnabled is true in settings
+                ruleManager.incrementCounter(ruleId, type === "permanent" ? "permanent" : "temp", count);
+
+                window.dispatchEvent(new CustomEvent("web-assassin:elements-deleted", {
+                    detail: {
+                        ruleID: ruleId,
+                        deletionType: type === "permanent" ? "permanent" : "temp",
+                        count
                     }
-                } catch (err) {
-                    console.warn(`⚠️ Invalid selector "${sel}"`, err && err.message);
+                }));
+            }
+        }
+
+        // remove elements array (Set) and compute per-rule counts
+        function removeElementsAndCount(elements, selectorOrigins, deletionType) {
+            // selectorOrigins: Map selector -> Set(ruleIds)
+            // elements: Set of elements to remove (no duplicates)
+            const countsByRule = new Map();
+
+            for (const el of elements) {
+                try {
+                    // for safety: if already removed skip
+                    if (!el.isConnected) {
+                        // even if not connected, we might still count? skip.
+                    }
+
+                    // determine which selectors matched this element by testing selectors (best-effort)
+                    // Instead of re-evaluating all selectors (heavy), we assume elements were discovered
+                    // using a specific selector; therefore, selectorOrigins has the selector(s) used previously.
+                    // We'll increment all ruleIds associated with any selector that matched this element.
+                    // To be conservative, we will test each selector in selectorOrigins map (could be many),
+                    // but we optimize by only testing those selectors we used to find the elements that led here.
+                    // Because callers will pass elements grouped by selector, we will instead accept a mapping
+                    // from selector->elements when possible. Simpler approach below:
+                    el.remove();
+                } catch (e) {
+                    try { el.parentNode && el.parentNode.removeChild(el); } catch (er) { }
                 }
             }
+
+            // Counting strategy: We rely on caller to send per-selector match counts (see below).
+            // This function only handles removal and does not attempt to rematch; return empty map.
+            return countsByRule;
         }
+
+        // ---------------------------------------------------------
+        // TEMPORARY DELETION PASS
+        // - runs for up to temporaryDeletionMax ms
+        // - stops early when DOM stabilizes (no mutations for debounce ms)
+        // - uses a MutationObserver to detect activity and triggers debounced scan
+        // ---------------------------------------------------------
+        function runTemporaryDeletion(tempSelectorsArr) {
+            const settings = ruleManager.getSettings().deletionSettings || {};
+            const maxMs = Math.max(0, Number(settings.temporaryDeletionMax || 3000));
+            const minMs = Math.max(0, Number(settings.temporaryDeletionMin || 500));
+            const debounceStabilizeMs = Math.max(150, Math.floor((minMs + maxMs) / 6));
+            const mutationDebounce = Math.max(50, Number(settings.mutationObserverDebounceInterval || 250));
+
+            if (!tempSelectorsArr || !tempSelectorsArr.length) return Promise.resolve({ totalDeleted: 0, perRuleCounts: new Map() });
+            const selectorToRules = new Map();
+            for (const [sel, set] of tempSelectorMap.entries()) selectorToRules.set(sel, new Set(set));
+            const removedSet = new Set();
+            const perRuleCounts = new Map();
+
+            function scanAll() {
+                for (const sel of tempSelectorsArr) {
+                    let elems = [];
+                    try { elems = Array.from(doc.querySelectorAll(sel)); } catch (e) { continue; }
+                    for (const el of elems) {
+                        if (!el || !(el instanceof Element)) continue;
+                        if (removedSet.has(el)) continue;
+
+                        try { el.remove(); } catch (e) { try { el.parentNode && el.parentNode.removeChild(el); } catch (e) { } }
+                        removedSet.add(el);
+
+                        const ruleIds = selectorToRules.get(sel) || new Set();
+                        for (const id of ruleIds) {
+                            perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                        }
+                    }
+                }
+            }
+
+            return new Promise((resolve) => {
+                let done = false;
+
+                scanAll();
+
+                const mo = new MutationObserver((mutations) => {
+                    if (tempStabilizeDebounce) clearTimeout(tempStabilizeDebounce);
+                    tempStabilizeDebounce = setTimeout(() => {
+                        scanAll();
+                    }, mutationDebounce);
+                });
+                try {
+                    mo.observe(doc.documentElement || doc.body, { childList: true, subtree: true, attributes: false, characterData: false });
+                } catch (e) {
+                    try { mo.observe(doc.body || doc.documentElement, { childList: true, subtree: true }); } catch (er) { }
+                }
+
+                function scheduleStopEarly() {
+                    if (tempStabilizeDebounce) clearTimeout(tempStabilizeDebounce);
+                    tempStabilizeDebounce = setTimeout(() => {
+                        if (done) return;
+                        done = true;
+                        try { mo.disconnect(); } catch (e) { }
+                        if (tempStopTimer) { clearTimeout(tempStopTimer); tempStopTimer = null; }
+                        handleDeletionCounts(perRuleCounts, "temp");
+                        resolve({ totalDeleted: removedSet.size, perRuleCounts });
+                    }, debounceStabilizeMs);
+                }
+
+                scheduleStopEarly();
+                tempStopTimer = setTimeout(() => {
+                    if (done) return;
+                    done = true;
+                    try { mo.disconnect(); } catch (e) { }
+                    if (tempStabilizeDebounce) { clearTimeout(tempStabilizeDebounce); tempStabilizeDebounce = null; }
+                    handleDeletionCounts(perRuleCounts, "temp");
+                    resolve({ totalDeleted: removedSet.size, perRuleCounts });
+                }, maxMs);
+            });
+        }
+
+
+        // ---------------------------------------------------------
+        // PERMANENT DELETION OBSERVER
+        // - watches added nodes only
+        // - debounced processing to batch added nodes
+        // ---------------------------------------------------------
+        function startPermanentObserver(permSelectorsArr) {
+            const settings = ruleManager.getSettings().deletionSettings || {};
+            const debounceMs = Math.max(50, Number(settings.peridoicURLMutationDebounce || settings.mutationObserverDebounceInterval || 250));
+            let nodesQueue = new Set();
+
+            function processQueue() {
+                if (!nodesQueue.size) return;
+                const nodes = Array.from(nodesQueue);
+                nodesQueue.clear();
+                const selectorToRules = new Map();
+                for (const [sel, set] of permSelectorMap.entries()) selectorToRules.set(sel, new Set(set));
+
+                const removed = new Set();
+                const perRuleCounts = new Map();
+
+                for (const node of nodes) {
+                    if (!node) continue;
+
+                    const rootCandidates = (node.nodeType === 1) ? [node] : [];
+
+                    for (const sel of permSelectorsArr) {
+                        try {
+                            for (const rootNode of rootCandidates) {
+                                try {
+                                    if (rootNode.matches && rootNode.matches(sel)) {
+                                        if (!removed.has(rootNode)) {
+                                            try { rootNode.remove(); } catch (e) { try { rootNode.parentNode && rootNode.parentNode.removeChild(rootNode); } catch (er) { } }
+                                            removed.add(rootNode);
+                                            const ruleIds = selectorToRules.get(sel) || new Set();
+                                            for (const id of ruleIds) perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                                        }
+                                    }
+                                } catch (e) { /* invalid selector on rootNode.matches - skip */ }
+                            }
+                            let matches = [];
+                            try { matches = Array.from(node.querySelectorAll ? node.querySelectorAll(sel) : []); } catch (e) { continue; }
+                            for (const m of matches) {
+                                if (!m || !(m instanceof Element)) continue;
+                                if (removed.has(m)) continue;
+                                try { m.remove(); } catch (e) { try { m.parentNode && m.parentNode.removeChild(m); } catch (er) { } }
+                                removed.add(m);
+                                const ruleIds = selectorToRules.get(sel) || new Set();
+                                for (const id of ruleIds) perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                            }
+                        } catch (e) { /* swallow */ }
+                    }
+                }
+                handleDeletionCounts(perRuleCounts, "permanent");
+            }
+
+            function scheduleProcess() {
+                if (permDebounceTimer) clearTimeout(permDebounceTimer);
+                permDebounceTimer = setTimeout(() => {
+                    processQueue();
+                }, debounceMs);
+            }
+
+            permObserver = new MutationObserver((mutations) => {
+                for (const m of mutations) {
+                    for (const n of m.addedNodes) {
+                        nodesQueue.add(n);
+                    }
+                }
+                scheduleProcess();
+            });
+
+            try {
+                permObserver.observe(doc.documentElement || doc.body, { childList: true, subtree: true });
+            } catch (e) {
+                try { permObserver.observe(doc.body || doc.documentElement, { childList: true, subtree: true }); } catch (er) { }
+            }
+
+            return () => {
+                try { permObserver && permObserver.disconnect(); } catch (e) { }
+                permObserver = null;
+                if (permDebounceTimer) { clearTimeout(permDebounceTimer); permDebounceTimer = null; }
+            };
+        }
+
+
+        // ---------------------------------------------------------
+        // URL change detection (history API + popstate + hashchange + optional periodic)
+        // ---------------------------------------------------------
+        function installUrlObservers() {
+            if (urlObserversInstalled) return;
+            urlObserversInstalled = true;
+
+            // patch history.pushState / replaceState
+            const origPush = history.pushState;
+            const origReplace = history.replaceState;
+            history.pushState = function (...args) {
+                const result = origPush.apply(this, args);
+                scheduleUrlChange();
+                return result;
+            };
+            history.replaceState = function (...args) {
+                const result = origReplace.apply(this, args);
+                scheduleUrlChange();
+                return result;
+            };
+
+            window.addEventListener("popstate", scheduleUrlChange);
+            window.addEventListener("hashchange", scheduleUrlChange);
+
+            const settings = ruleManager.getSettings();
+            if (settings.deletionSettings?.peridoicURLCheck) {
+                periodicUrlTimer = setInterval(() => {
+                    if (location.href !== lastUrl) scheduleUrlChange();
+                }, Math.max(500, Number(settings.deletionSettings.peridoicURLCheckInterval || 5000)));
+            }
+        }
+
+        function uninstallUrlObservers() {
+            if (!urlObserversInstalled) return;
+            urlObserversInstalled = false;
+            try {
+                // cannot easily restore original push/replace references in all runtime cases; keep patched functions
+            } catch (e) { }
+            try { window.removeEventListener("popstate", scheduleUrlChange); } catch (e) { }
+            try { window.removeEventListener("hashchange", scheduleUrlChange); } catch (e) { }
+            if (periodicUrlTimer) { clearInterval(periodicUrlTimer); periodicUrlTimer = null; }
+        }
+
+        let urlChangeDebounce = null;
+        function scheduleUrlChange() {
+            // debounce a little to avoid flapping
+            if (urlChangeDebounce) clearTimeout(urlChangeDebounce);
+            urlChangeDebounce = setTimeout(() => {
+                urlChangeDebounce = null;
+                const newUrl = location.href;
+                if (newUrl === lastUrl) return;
+                lastUrl = newUrl;
+                // restart engine on URL change
+                restart();
+            }, 120);
+        }
+
+        // ---------------------------------------------------------
+        // main bootstrap logic
+        // ---------------------------------------------------------
+        async function start() {
+            if (running) return;
+            running = true;
+            lastUrl = location.href;
+
+            const settings = ruleManager.getSettings();
+            if (settings.deletionSettings?.scriptDisabled) {
+                // don't run if disabled
+                return;
+            }
+
+            // Stage 1: check if any rule matches current page
+            const allRules = ruleManager.getAllRules() || [];
+            const pageDomain = location.href;
+            // Only consider enabled rules when deciding whether we have any matches.
+            const matchesAny = allRules.some(r => (r.ruleEnabled !== false) && domainMatches(r.domain, pageDomain));
+            if (!matchesAny) {
+                // still install URL observers so engine can start on SPA navigation
+                installUrlObservers();
+                return;
+            }
+
+            // Stage 2: aggregate selectors from matching rules
+            const { tempSelectors, permSelectors } = aggregateSelectorsForCurrentPage();
+
+            // Stage 3: early exit if nothing to delete
+            if ((!tempSelectors || tempSelectors.length === 0) && (!permSelectors || permSelectors.length === 0)) {
+                installUrlObservers();
+                return;
+            }
+
+            // Run temp deletion (short-lived)
+            try {
+                await runTemporaryDeletion(tempSelectors);
+            } catch (e) {
+                // ignore
+            }
+
+            // Setup permanent observer (long-lived)
+            const stopPerm = startPermanentObserver(permSelectors);
+
+            // install URL observers (so we can restart on URL change)
+            installUrlObservers();
+
+            // store stop function on module state for later
+            // when stopping engine, call stopPerm()
+            permStopFn = stopPerm;
+        }
+
+        let permStopFn = null;
+
+        // stop/cleanup everything
+        function stop() {
+            if (!running) return;
+            running = false;
+            try {
+                if (tempObserver) { tempObserver.disconnect(); tempObserver = null; }
+            } catch (e) { }
+            try {
+                if (permObserver) { permObserver.disconnect(); permObserver = null; }
+            } catch (e) { }
+            if (permStopFn) {
+                try { permStopFn(); } catch (e) { }
+                permStopFn = null;
+            }
+            try {
+                uninstallUrlObservers();
+            } catch (e) { }
+            if (tempStopTimer) { clearTimeout(tempStopTimer); tempStopTimer = null; }
+            if (tempStabilizeDebounce) { clearTimeout(tempStabilizeDebounce); tempStabilizeDebounce = null; }
+            if (permDebounceTimer) { clearTimeout(permDebounceTimer); permDebounceTimer = null; }
+        }
+
+        // restart (stop then start)
+        async function restart() {
+            const settings = ruleManager.getSettings();
+
+            // ⛔ Abort if script is disabled
+            if (settings?.deletionSettings?.scriptDisabled) {
+                console.warn("[WebAssassin] Script disabled — restart aborted.");
+                return;
+            }
+
+            stop();
+            await Promise.resolve(); // yield
+            start();
+        }
+
+
+        // alias
+        function refresh() { return restart(); }
+
+        // external hook registration for delete events
+        const deleteListeners = new Set();
+        function onDeleted(cb) {
+            if (typeof cb !== "function") return () => { };
+            deleteListeners.add(cb);
+            return () => deleteListeners.delete(cb);
+        }
+
+        // internal wrapper to call registered callbacks (also dispatches global event already in handleDeletionCounts)
+        function notifyDeletedCallbacks(detail) {
+            for (const cb of deleteListeners) {
+                try { cb(detail); } catch (e) { }
+            }
+        }
+
+        // We attach to DOM-level event the engine emits already in handleDeletionCounts,
+        // but also provide programmatic hook:
+        window.addEventListener("web-assassin:elements-deleted", (e) => {
+            notifyDeletedCallbacks(e.detail);
+        });
+
+        function isRunning() { return running; }
+
+        // public API
+        return {
+            start,
+            stop,
+            restart,
+            refresh,
+            onDeleted,
+            isRunning
+        };
     }
 
-    /* -----------------------
-       STORAGE & SETTINGS
-    ------------------------*/
-    // Load settings (all keys except we intentionally do not pull deletion_rules into CONFIG)
-    async function loadAndInitializeSettings() {
-        const keys = Object.keys(SETTINGS_DEFAULTS);
-        // Fetch all at once
-        const values = await Promise.all(keys.map(k => GM.getValue(k)));
-        const initFlag = await GM.getValue(INIT_FLAG_KEY);
-        const needsInit = !initFlag;
+    // ----------------------
+    // UI core: shadow root, factory helpers, and components
+    // ----------------------
+    async function initUI() {
+        // Try to obtain the shared RuleManager and Engine from window.
+        // If they're not present yet, wait briefly for the bootstrap to set them.
+        // If still missing after waiting, create fallback instances from persisted settings.
+        async function waitForGlobals(timeout = 1500, interval = 100) {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                if (window.webAssassinRuleManager && window.webAssassinEngine) return;
+                await new Promise((r) => setTimeout(r, interval));
+            }
+        }
 
-        const toStore = {};
-        keys.forEach((k, idx) => {
-            const v = values[idx];
-            const isInvalid = (x) => x === undefined || x === null;
-            if (needsInit && isInvalid(v)) {
-                CONFIG[k] = SETTINGS_DEFAULTS[k];
-                toStore[k] = SETTINGS_DEFAULTS[k];
-            } else {
-                CONFIG[k] = isInvalid(v) ? SETTINGS_DEFAULTS[k] : v;
+        let ruleManager = window.webAssassinRuleManager;
+        let engine = window.webAssassinEngine;
+
+        if (!ruleManager || !engine) {
+            // Wait a short time for the bootstrap code to set these globals (SPA / ordering races).
+            await waitForGlobals(1500, 100);
+            ruleManager = window.webAssassinRuleManager;
+            engine = window.webAssassinEngine;
+        }
+
+        if (!ruleManager || !engine) {
+            // As a last resort, attempt to instantiate fallback instances from persisted settings.
+            try {
+                const saved = await gmGet(GM_KEY, JSON.parse(JSON.stringify(DEFAULT_SETTINGS)));
+                const rm = RuleManager(saved);
+                const eng = DeletionEngine(rm);
+                window.webAssassinRuleManager = rm;
+                window.webAssassinEngine = eng;
+                ruleManager = rm;
+                engine = eng;
+                // start engine unless explicitly disabled in settings
+                if (!saved.deletionSettings?.scriptDisabled) {
+                    try { eng.start(); } catch (e) { /* ignore start errors */ }
+                }
+            } catch (err) {
+                console.warn("UI init aborted: RuleManager or Engine missing.", err);
+                return null;
+            }
+        }
+
+        // Local per-load counters for display (not persisted)
+        const perLoadCounts = new Map();
+
+        // Utils
+        const cssEscape = (s) => (typeof CSS !== "undefined" && CSS.escape) ? CSS.escape(s) : s.replace(/([ #;.<>+~:,[\]\/])/g, "\\$1");
+
+        function qS(root, sel) { return root.querySelector(sel); }
+        function qSA(root, sel) { return Array.from(root.querySelectorAll(sel)); }
+
+        // Get current settings from ruleManager
+        function getSettings() { return ruleManager.getSettings(); }
+
+        // Theme values
+        function themeVars() {
+            const s = getSettings();
+            const theme = s.theme || {};
+            const modeKey = theme.mode === "dark" ? "dark" : "light";
+            const mode = (theme && theme[modeKey]) || theme.light || {};
+            // Use font from theme.font (no top-level font)
+            return {
+                accent: mode.accent || "#3b82f6",
+                background: mode.background || "#ffffff",
+                background2: mode.background2 || "#f8fafc",
+                background3: mode.background3 || "#eee",
+                foreground: mode.foreground || "#0f172a",
+                border: mode.border || "rgba(0,0,0,0.08)",
+                rounded: (theme.rounded || "12px"),
+                font: (theme.font || DEFAULT_SETTINGS.theme.font)
+            };
+        }
+
+        // Create host element and attach shadow root
+        const hostId = "web-assassin-ui-root";
+        let host = document.getElementById(hostId);
+        if (host) host.remove();
+        host = document.createElement("div");
+        host.id = hostId;
+        host.style.all = "initial";
+        document.documentElement.appendChild(host);
+        const shadow = host.attachShadow({ mode: "open" });
+
+        // Base HTML structure
+        const root = document.createElement("div");
+        root.className = "wa-root";
+
+        // Inject styles (centralized)
+        const style = document.createElement("style");
+
+        function buildStyles() {
+            const t = themeVars();
+            return `
+/* Ensure host and core containers use the chosen UI font */
+:host { all: initial; font-family: ${t.font}; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; }
+.wa-root, .wa-panel, .wa-header, .wa-title, .wa-card, .wa-main, .wa-sidebar, .wa-content, .wa-editor-window {
+    font-family: ${t.font};
+}
+/* Apply to controls and text-bearing elements explicitly to avoid UA fallback */
+.wa-btn, button, input, textarea, select, .wa-input, .wa-toggle, .wa-small, .wa-rule-meta, .wa-tab, .wa-title, .wa-editor-id {
+    font-family: ${t.font};
+}
+
+/* Custom scrollbar for all UI elements */
+.wa-root * {
+    scrollbar-width: thin;
+    scrollbar-color: ${t.accent} transparent;
+}
+.wa-root *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+.wa-root *::-webkit-scrollbar-track {
+    background: transparent;
+}
+.wa-root *::-webkit-scrollbar-thumb {
+    background: ${t.accent};
+    border-radius: 4px;
+    transition: background-color 0.2s ease;
+}
+.wa-root *::-webkit-scrollbar-thumb:hover {
+    background: ${t.accent}CC;
+}
+
+.wa-root { position: fixed; z-index: 2147483647; pointer-events: none; }
+/* Floating icon */
+.web-assassin-fab {
+    position: fixed;
+    width: 52px;
+    height: 52px;
+    bottom: 24px;
+    right: 24px;
+    border-radius: 16px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: grab;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+    background: linear-gradient(135deg, ${t.accent}, ${t.accent}CC);
+    color: white;
+    font-weight: 600;
+    font-size: 20px;
+    pointer-events: auto;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(12px);
+    border: 1px solid ${t.border};
+}
+.web-assassin-fab:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 12px 32px rgba(0,0,0,0.2);
+}
+.web-assassin-fab:active {
+    cursor: grabbing;
+    transform: scale(0.95);
+}
+
+/* Panel window (draggable + resizable) */
+.web-assassin-panel {
+    position: fixed;
+    width: 760px;
+    height: 560px;
+    min-width: 400px;
+    min-height: 320px;
+    bottom: 100px;
+    right: 24px;
+    pointer-events: auto;
+    background: ${t.background};
+    color: ${t.foreground};
+    border: 0px solid ${t.border};
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.2), 0 0 0 1px ${t.border};
+    display: none;
+    overflow: hidden;
+    resize: none;
+    backdrop-filter: blur(20px);
+}
+.web-assassin-panel.show {
+    display: block;
+    animation: wa-panel-appear 0.3s ease-out;
+}
+@keyframes wa-panel-appear {
+    from { opacity: 0; transform: translateY(20px) scale(0.98); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.wa-header {
+    height: 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 16px 20px;
+
+    /* Darkened gradient */
+    background: linear-gradient(
+        180deg,
+        color-mix(in srgb, ${t.accent} 60%, black 40%),
+        color-mix(in srgb, ${t.accent} 20%, black 80%)
+    );
+
+    border-bottom: 1px solid ${t.border};
+    cursor: grab;
+    border-radius: 20px 20px 0 0;
+}
+
+.wa-title {
+    font-weight: 600;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+    color: #e6eef8;
+}
+.wa-toolbar {
+    margin-left: auto;
+    display: flex;
+    gap: 10px;
+    align-items: center;
+}
+.wa-content {
+    display: flex;
+    height: calc(100% - 60px);
+    background: ${t.background};
+}
+
+.wa-sidebar {
+    width: 180px;
+    border-right: 1px solid ${t.border};
+    padding: 16px;
+    box-sizing: border-box;
+    overflow: auto;
+    background: ${t.background2};
+    backdrop-filter: blur(10px);
+}
+.wa-main {
+    flex: 1;
+    padding: 16px;
+    overflow: auto;
+    background: ${t.background};
+}
+
+.wa-tab {
+    display: block;
+    padding: 12px 14px;
+    margin-bottom: 8px;
+    border-radius: 12px;
+    cursor: pointer;
+    font-weight: 500;
+    transition: all 0.2s ease;
+    border: 1px solid transparent;
+}
+.wa-tab:hover {
+    background: ${t.background3};
+}
+.wa-tab.active {
+    background: ${t.accent};
+    color: white;
+    border-color: ${t.accent};
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+
+.wa-card {
+    background: ${t.background2};
+    border: 1px solid ${t.border};
+    padding: 16px;
+    border-radius: 16px;
+    margin-bottom: 16px;
+    transition: all 0.2s ease;
+    backdrop-filter: blur(8px);
+}
+.wa-card:hover {
+    border-color: ${t.accent}80;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+}
+
+.wa-btn {
+    padding: 10px 16px;
+    border-radius: 12px;
+    border: 1px solid ${t.border};
+    cursor: pointer;
+    background: ${t.background3};
+    font-weight: 500;
+    transition: all 0.2s ease;
+    color: ${t.foreground}; /* Change text color based on mode */
+}
+.wa-btn:hover {
+    background: ${t.background3}CC;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.wa-btn.primary {
+    background: ${t.accent};
+    color: white;
+    border-color: transparent;
+}
+.wa-btn.primary:hover {
+    background: ${t.accent}CC;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+}
+.wa-btn.small {
+    padding: 6px 12px;
+    font-size: 13px;
+}
+
+.wa-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    padding: 8px;
+    border-radius: 8px;
+    transition: all 0.2s ease;
+}
+.wa-toggle:hover {
+    background: ${t.background3};
+}
+.wa-toggle .toggle-switch {
+    width: 44px;
+    height: 24px;
+    background: ${t.background3};
+    border-radius: 12px;
+    position: relative;
+    transition: all 0.2s ease;
+}
+.wa-toggle .toggle-switch::after {
+    content: '';
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    border-radius: 10px;
+    background: ${t.foreground};
+    top: 2px;
+    left: 2px;
+    transition: all 0.2s ease;
+}
+.wa-toggle.checked .toggle-switch {
+    background: ${t.accent};
+}
+.wa-toggle.checked .toggle-switch::after {
+    left: 22px;
+    background: white;
+}
+
+.wa-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.wa-rule-card {
+    border: 1px solid ${t.border};
+    padding: 14px;
+    border-radius: 14px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    background: ${t.background2};
+    transition: all 0.2s ease;
+    border: 1px solid ${t.border};
+}
+.wa-rule-card:hover {
+    border-color: ${t.accent}80;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+    transform: translateY(-1px);
+}
+.wa-rule-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+}
+.wa-small {
+    font-size: 13px;
+    opacity: 0.7;
+    font-weight: 400;
+}
+
+.wa-editor-modal {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0,0,0,0.5);
+    backdrop-filter: blur(12px);
+    z-index: 2147483650;
+    pointer-events: auto;
+}
+.wa-editor-window {
+    width: 800px;
+    max-width: calc(100% - 48px);
+    max-height: calc(100% - 48px);
+    background: ${t.background};
+    color: ${t.foreground};
+    border-radius: 20px;
+    border: 1px solid ${t.border};
+    box-shadow: 0 30px 80px rgba(0,0,0,0.3);
+    overflow: auto;
+    padding: 20px;
+    animation: wa-modal-appear 0.3s ease-out;
+}
+@keyframes wa-modal-appear {
+    from { opacity: 0; transform: scale(0.95); }
+    to { opacity: 1; transform: scale(1); }
+}
+.wa-editor-header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+    padding-bottom: 16px;
+    border-bottom: 1px solid ${t.border};
+}
+.wa-form-row {
+    display: flex;
+    gap: 12px;
+    margin-bottom: 16px;
+    align-items: center;
+}
+.wa-input, textarea {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 12px;
+    border: 1px solid ${t.border};
+    background: ${t.background2};
+    color: ${t.foreground};
+    box-sizing: border-box;
+    font-family: ${t.font};
+    transition: all 0.2s ease;
+    border: 1px solid ${t.border};
+}
+.wa-input:focus, textarea:focus {
+    outline: none;
+    border-color: ${t.accent};
+    box-shadow: 0 0 0 2px ${t.accent}40;
+}
+.wa-selector-item {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    padding: 12px;
+    background: ${t.background2};
+    border-radius: 12px;
+    border: 1px solid ${t.border};
+    transition: all 0.2s ease;
+}
+.wa-selector-item:hover {
+    border-color: ${t.accent}80;
+}
+.wa-resize-grip {
+    position: absolute;
+    width: 20px;
+    height: 20px;
+    right: 8px;
+    bottom: 8px;
+    cursor: se-resize;
+    background: linear-gradient(135deg, ${t.background3}, ${t.background2});
+    border-radius: 4px;
+    border: 1px solid ${t.border};
+    transition: all 0.2s ease;
+}
+.wa-resize-grip:hover {
+    background: linear-gradient(135deg, ${t.accent}, ${t.accent}80);
+    border-color: ${t.accent};
+}
+
+.wa-footer {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+    justify-content: flex-end;
+    padding-top: 16px;
+    border-top: 1px solid ${t.border};
+}
+
+.wa-toast-wrap {
+    position: fixed;
+    right: 32px;
+    bottom: 110px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    z-index: 2147483655;
+    pointer-events: none;
+}
+.wa-toast {
+    pointer-events: auto;
+    padding: 14px 18px;
+    border-radius: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+    color: white;
+    font-family: ${t.font};
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.1);
+    animation: wa-toast-appear 0.3s ease-out;
+}
+@keyframes wa-toast-appear {
+    from { opacity: 0; transform: translateX(100%); }
+    to { opacity: 1; transform: translateX(0); }
+}
+.wa-toast.success {
+    background: linear-gradient(135deg, #16a34a, #22c55e);
+}
+.wa-toast.error {
+    background: linear-gradient(135deg, #dc2626, #ef4444);
+}
+
+.wa-confirm {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+/* Stats and metrics styling */
+.wa-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 16px;
+    margin: 16px 0;
+}
+.wa-stat-card {
+    background: ${t.background2};
+    padding: 16px;
+    border-radius: 12px;
+    text-align: center;
+    border: 1px solid ${t.border};
+}
+.wa-stat-value {
+    font-size: 24px;
+    font-weight: 600;
+    color: ${t.accent};
+    margin-bottom: 4px;
+}
+.wa-stat-label {
+    font-size: 13px;
+    opacity: 0.7;
+}
+
+/* Ensure the editor id element (display-only) uses the same font */
+#wa-editor-id {
+    font-family: ${t.font};
+    font-size: 13px;
+    opacity: 0.7;
+}
+`;
+        }
+
+        style.textContent = buildStyles();
+        shadow.appendChild(style);
+
+        // Build floating FAB
+        const fab = document.createElement("div");
+        fab.className = "web-assassin-fab";
+        fab.title = "Web Assassin";
+        fab.innerHTML = `<span style="user-select:none;">WA</span>`;
+        root.appendChild(fab);
+
+        // Build panel
+        const panel = document.createElement("div");
+        panel.className = "web-assassin-panel";
+        panel.innerHTML = `
+    <div class="wa-header">
+      <div class="wa-title">Web Assassin</div>
+      <div class="wa-toolbar">
+        <button class="wa-btn" data-action="refresh">Refresh</button>
+        <button class="wa-btn" data-action="close">Close</button>
+      </div>
+    </div>
+    <div class="wa-content">
+      <div class="wa-sidebar">
+        <div class="wa-tab" data-tab="status">Status</div>
+        <div class="wa-tab" data-tab="rules">Rules</div>
+        <div class="wa-tab" data-tab="stats">Statistics</div>
+        <div class="wa-tab" data-tab="settings">Settings</div>
+      </div>
+      <div class="wa-main" data-pane>
+        <!-- dynamic -->
+      </div>
+    </div>
+    <div class="wa-resize-grip" title="Resize"></div>
+  `;
+        root.appendChild(panel);
+
+        // Toast container
+        const toastWrap = document.createElement("div");
+        toastWrap.className = "wa-toast-wrap";
+        root.appendChild(toastWrap);
+
+        shadow.appendChild(root);
+
+        // State
+        let panelVisible = false;
+        let currentTab = getSettings().ui?.lastTab || "rules";
+        let editorOpen = false;
+        let editorTemp = null;
+        let editorMode = "add"; // add | edit
+        let lastDrag = { x: 0, y: 0, dragging: false, panelDragging: false, fabDragging: false };
+        let resizeState = { resizing: false, startW: 0, startH: 0, startX: 0, startY: 0 };
+
+        // Position persistence keys
+        const POS_KEY = "web_assassin_ui_pos";
+        async function saveUIPos(pos) {
+            try {
+                const s = ruleManager.getSettings();
+                s.ui = s.ui || {};
+                s.ui._panelPos = pos;
+                ruleManager.setSettings(s);
+            } catch (e) { /* ignore */ }
+        }
+        function readUIPos() {
+            try { const s = ruleManager.getSettings(); return s.ui?._panelPos || null; } catch (e) { return null; }
+        }
+
+        // Apply saved position if exists
+        const savedPos = readUIPos();
+        // ensure panel stays inside viewport
+        function ensurePanelInViewport() {
+            try {
+                // clamp width / height
+                const maxW = Math.max(360, window.innerWidth - 16);
+                const maxH = Math.max(280, window.innerHeight - 16);
+                const curW = panel.getBoundingClientRect().width;
+                const curH = panel.getBoundingClientRect().height;
+                if (curW > maxW) panel.style.width = maxW + "px";
+                if (curH > maxH) panel.style.height = maxH + "px";
+
+                const rect = panel.getBoundingClientRect();
+                const width = rect.width;
+                const height = rect.height;
+                let left = rect.left;
+                let top = rect.top;
+
+                // if positioned with right/bottom, convert to left/top
+                if (panel.style.right && !panel.style.left) {
+                    left = window.innerWidth - (parseFloat(panel.style.right) || (window.innerWidth - rect.right)) - width;
+                }
+                if (panel.style.bottom && !panel.style.top) {
+                    top = window.innerHeight - (parseFloat(panel.style.bottom) || (window.innerHeight - rect.bottom)) - height;
+                }
+
+                const clampedLeft = Math.min(Math.max(8, Math.round(left)), Math.max(8, Math.round(window.innerWidth - width - 8)));
+                const clampedTop = Math.min(Math.max(8, Math.round(top)), Math.max(8, Math.round(window.innerHeight - height - 8)));
+
+                panel.style.left = clampedLeft + "px";
+                panel.style.top = clampedTop + "px";
+                panel.style.right = "auto";
+                panel.style.bottom = "auto";
+            } catch (e) { /* ignore */ }
+        }
+        if (savedPos && typeof savedPos === "object") {
+            if (savedPos.width) panel.style.width = savedPos.width;
+            if (savedPos.height) panel.style.height = savedPos.height;
+            if (savedPos.left !== undefined) panel.style.left = savedPos.left;
+            if (savedPos.top !== undefined) panel.style.top = savedPos.top;
+            else {
+                if (savedPos.right !== undefined) panel.style.right = savedPos.right;
+                if (savedPos.bottom !== undefined) panel.style.bottom = savedPos.bottom;
+            }
+            // clamp into viewport
+            ensurePanelInViewport();
+        }
+
+        // Show/hide helpers
+        function showPanel() { panel.classList.add("show"); panelVisible = true; renderCurrentTab(); }
+        function hidePanel() { panel.classList.remove("show"); panelVisible = false; }
+        function togglePanel() { panelVisible ? hidePanel() : showPanel(); }
+
+        // FAB drag
+        fab.addEventListener("mousedown", (ev) => {
+            lastDrag.fabDragging = true;
+            lastDrag.x = ev.clientX; lastDrag.y = ev.clientY;
+            fab.style.transition = "none";
+            ev.preventDefault();
+        });
+        document.addEventListener("mousemove", (ev) => {
+            if (lastDrag.fabDragging) {
+                const dx = ev.clientX - lastDrag.x;
+                const dy = ev.clientY - lastDrag.y;
+                lastDrag.x = ev.clientX;
+                lastDrag.y = ev.clientY;
+
+                // Update position
+                const rect = fab.getBoundingClientRect();
+                const newLeft = rect.left + dx; // Move left based on mouse movement
+                const newTop = rect.top + dy;   // Move top based on mouse movement
+
+                // Clamp to window boundaries
+                const clampedLeft = Math.min(
+                    Math.max(8, newLeft),
+                    window.innerWidth - rect.width - 8
+                );
+                const clampedTop = Math.min(
+                    Math.max(8, newTop),
+                    window.innerHeight - rect.height - 8
+                );
+
+                // Apply the new position
+                fab.style.left = `${clampedLeft}px`;
+                fab.style.top = `${clampedTop}px`;
+                fab.style.right = "auto";  // Remove right to avoid interference
+                fab.style.bottom = "auto"; // Remove bottom to avoid interference
+
+                // Persist position as UI state
+                saveUIPos({ left: fab.style.left, top: fab.style.top });
+            }
+
+            if (lastDrag.panelDragging) {
+                const dx = ev.clientX - lastDrag.x;
+                const dy = ev.clientY - lastDrag.y;
+                lastDrag.x = ev.clientX;
+                lastDrag.y = ev.clientY;
+
+                // Move panel using left/top and clamp to viewport
+                const rect = panel.getBoundingClientRect();
+                const newLeft = rect.left + dx;
+                const newTop = rect.top + dy;
+                const width = rect.width;
+                const height = rect.height;
+
+                const clampedLeft = Math.min(
+                    Math.max(8, Math.round(newLeft)),
+                    Math.max(8, Math.round(window.innerWidth - width - 8))
+                );
+                const clampedTop = Math.min(
+                    Math.max(8, Math.round(newTop)),
+                    Math.max(8, Math.round(window.innerHeight - height - 8))
+                );
+
+                panel.style.left = clampedLeft + "px";
+                panel.style.top = clampedTop + "px";
+                panel.style.right = "auto";  // Remove right to avoid interference
+                panel.style.bottom = "auto"; // Remove bottom to avoid interference
+
+                // Persist position as UI state
+                saveUIPos({
+                    left: panel.style.left,
+                    top: panel.style.top,
+                    width: panel.style.width,
+                    height: panel.style.height
+                });
+            }
+
+            if (resizeState.resizing) {
+                const nx = ev.clientX;
+                const ny = ev.clientY;
+                const dw = nx - resizeState.startX;
+                const dh = ny - resizeState.startY;
+                const maxW = Math.max(360, window.innerWidth - 16);
+                const maxH = Math.max(280, window.innerHeight - 16);
+                const newW = Math.min(maxW, Math.max(360, resizeState.startW + dw));
+                const newH = Math.min(maxH, Math.max(280, resizeState.startH + dh));
+                panel.style.width = newW + "px";
+                panel.style.height = newH + "px";
             }
         });
 
-        if (Object.keys(toStore).length > 0) {
-            await Promise.all(Object.entries(toStore).map(([k, v]) => GM.setValue(k, v)));
+        document.addEventListener("mouseup", (ev) => {
+            if (lastDrag.fabDragging) {
+                lastDrag.fabDragging = false;
+                fab.style.transition = "";
+                saveUIPos({ right: fab.style.right, bottom: fab.style.bottom });
+            }
+            if (lastDrag.panelDragging) {
+                lastDrag.panelDragging = false;
+                // convert to left/top style for persistence
+                ensurePanelInViewport();
+                saveUIPos({ left: panel.style.left, top: panel.style.top, width: panel.style.width, height: panel.style.height });
+            }
+            if (resizeState.resizing) {
+                resizeState.resizing = false;
+                ensurePanelInViewport();
+                saveUIPos({ left: panel.style.left, top: panel.style.top, width: panel.style.width, height: panel.style.height });
+            }
+        });
+
+        // Toggle panel on FAB click
+        fab.addEventListener("click", (ev) => {
+            // prevent click if dragging
+            if (lastDrag.fabDragging) return;
+            togglePanel();
+        });
+
+        // Panel close / refresh
+        qS(panel, '[data-action="close"]').addEventListener("click", () => hidePanel());
+        qS(panel, '[data-action="refresh"]').addEventListener("click", async () => {
+            await engine.restart?.();
+            toast("Engine refreshed", "success");
+        });
+
+        // Make header draggable
+        const header = qS(panel, ".wa-header");
+        header.addEventListener("mousedown", (ev) => {
+            lastDrag.panelDragging = true;
+            lastDrag.x = ev.clientX; lastDrag.y = ev.clientY;
+            ev.preventDefault();
+        });
+
+        // Resize grip
+        const grip = qS(panel, ".wa-resize-grip");
+        grip.addEventListener("mousedown", (ev) => {
+            resizeState.resizing = true;
+            resizeState.startW = panel.getBoundingClientRect().width;
+            resizeState.startH = panel.getBoundingClientRect().height;
+            resizeState.startX = ev.clientX;
+            resizeState.startY = ev.clientY;
+            ev.preventDefault();
+        });
+
+        // Tabs
+        const tabs = qSA(panel, ".wa-tab");
+        function setActiveTab(name) {
+            currentTab = name;
+            tabs.forEach(t => t.classList.toggle("active", t.dataset.tab === name));
+            const s = getSettings();
+            s.ui = s.ui || {};
+            s.ui.lastTab = name;
+            ruleManager.setSettings(s); // persist
+            renderCurrentTab();
         }
-        if (needsInit) await GM.setValue(INIT_FLAG_KEY, true);
+        tabs.forEach(t => t.addEventListener("click", () => setActiveTab(t.dataset.tab)));
+        // Initialize active tab
+        setTimeout(() => {
+            tabs.forEach(t => t.classList.toggle("active", t.dataset.tab === currentTab));
+        }, 0);
 
-        // don't keep deletion_rules in CONFIG to save memory; access it only during refresh/run
-        delete CONFIG.deletion_rules;
-        debug = CONFIG.debug_mode;
-        debugLog('✅ Settings loaded (CONFIG):', CONFIG);
-    }
-
-    /* -----------------------
-       CLEANUP & REFRESH
-    ------------------------*/
-    function cleanup() {
-        // disconnect observers
-        for (const obs of state.observers) {
-            try { obs.disconnect(); } catch (e) { }
-        }
-        state.observers = [];
-
-        // disconnect any SPA detection observers we added (they were also pushed into state.observers, but keep safety)
-        for (const obs of state._spaObservers || []) {
-            try { obs.disconnect(); } catch (e) { }
-        }
-        state._spaObservers = [];
-
-        // restore patched history if needed
-        if (state._historyPatched && state._originalHistory) {
+        // Toast system
+        function toast(msg, type = "info", ms = 3000) {
             try {
-                if (state._originalHistory.pushState) history.pushState = state._originalHistory.pushState;
-                if (state._originalHistory.replaceState) history.replaceState = state._originalHistory.replaceState;
-            } catch (e) { }
-            state._historyPatched = false;
-            state._originalHistory = {};
-        }
-
-        // remove url listeners
-        if (state._urlListeners && state._urlListeners.length) {
-            for (const { type, fn, opts } of state._urlListeners) {
-                try { window.removeEventListener(type, fn, opts); } catch (e) { }
-            }
-            state._urlListeners = [];
-        }
-
-        // clear url watcher
-        if (state.urlWatcherId) {
-            clearInterval(state.urlWatcherId);
-            state.urlWatcherId = null;
-        }
-
-        // clear pending sets
-        state.pendingForever.clear();
-        state.pendingOnce.clear();
-        // clear current lists
-        state.foreverList = [];
-        state.onceList = [];
-
-        // clear processors
-        state.processForeverDebounced = null;
-        state.processOnceDebounced = null;
-
-        debugLog('🧹 Cleanup finished');
-    }
-
-    // Expose a global refresh function for UI to call later
-    async function refreshEngine() {
-        debugLog('🔁 Manual refresh requested');
-        // re-load settings (in case user changed settings via UI)
-        await loadAndInitializeSettings();
-        runEngine(); // this will cleanup internally and re-run the lazy load
-    }
-    // attach to window
-    window.__vm_refreshEngine = refreshEngine;
-
-    /* -----------------------
-       LAZY-RULE LOADING & ENGINE
-    ------------------------*/
-
-    // Helper: load deletion_rules key and return parsed array (may be empty)
-    async function loadAllRulesArray() {
-        const raw = await GM.getValue('deletion_rules');
-        if (!raw) return [];
-        try {
-            const parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
-            if (!Array.isArray(parsed)) return [];
-            return parsed;
-        } catch (e) {
-            console.error('⚠️ deletion_rules parse error', e);
-            return [];
-        }
-    }
-
-    // Process a single added node against a list of normalized selectors:
-    // checks node itself and its descendants for matches (removes matched nodes).
-    function processNodeAgainstSelectors(node, selectors) {
-        if (!node || node.nodeType !== Node.ELEMENT_NODE) return;
-        try {
-            // check node itself first
-            for (const s of selectors) {
-                try {
-                    if (node.matches && node.matches(s.selector)) {
-                        node.remove();
-                        // increment correct counter depending on which list this was
-                        if (selectors === state.onceList) {
-                            window.__vm_deletedOnceCount++;  // Keep the count updated
-                            const deletedOnceEvent = new CustomEvent('vm-deleted-once', {
-                                detail: {
-                                    ruleName: s.ruleName,  // Pass rule name here
-                                    deletionType: 'once',  // Specify it's 'once'
-                                    count: window.__vm_deletedOnceCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedOnceEvent);
-                        } else if (selectors === state.foreverList) {
-                            window.__vm_deletedForeverCount++;  // Keep the count updated
-                            const deletedForeverEvent = new CustomEvent('vm-deleted-forever', {
-                                detail: {
-                                    ruleName: s.ruleName,  // Pass rule name here
-                                    deletionType: 'forever',  // Specify it's 'forever'
-                                    count: window.__vm_deletedForeverCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedForeverEvent);
-                        }
-                        debugLog(`🗑️ Removed node (self) for "${s.name}" — ${s.selector}`);
-                        return; // node removed; nothing more to check for this node
-                    }
-                } catch (e) {
-                    // invalid selector may throw on matches in some contexts
-                }
-            }
-
-            // check descendants
-            for (const s of selectors) {
-                try {
-                    const found = node.querySelectorAll(s.selector);
-                    if (found && found.length) {
-                        found.forEach(el => {
-                            try { el.remove(); } catch (e) { }
-                        });
-                        // attribute the count
-                        if (selectors === state.onceList) {
-                            window.__vm_deletedOnceCount += found.length;
-                            const deletedOnceEvent = new CustomEvent('vm-deleted-once', {
-                                detail: {
-                                    ruleName: s.ruleName,  // Pass rule name here
-                                    deletionType: 'once',  // Specify it's 'once'
-                                    count: window.__vm_deletedOnceCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedOnceEvent);
-                        } else if (selectors === state.foreverList) {
-                            window.__vm_deletedForeverCount += found.length;
-                            const deletedForeverEvent = new CustomEvent('vm-deleted-forever', {
-                                detail: {
-                                    ruleName: s.ruleName,  // Pass rule name here
-                                    deletionType: 'forever',  // Specify it's 'forever'
-                                    count: window.__vm_deletedForeverCount,
-                                }
-                            });
-                            window.dispatchEvent(deletedForeverEvent);
-                        }
-                        debugLog(`🗑️ Removed ${found.length} descendant(s) for "${s.name}" — ${s.selector}`);
-                    }
-                } catch (e) {
-                    // skip invalid selectors
-                }
-            }
-        } catch (e) {
-            // defensive
-        }
-    }
-
-
-    // Process pending nodes for a given set and selectors
-    function processPendingNodes(pendingSet, selectors) {
-        if (pendingSet.size === 0) return;
-        const nodes = Array.from(pendingSet);
-        pendingSet.clear(); // clear early to avoid re-processing while we operate
-        for (const node of nodes) {
-            // ensure node remains in DOM
-            if (!document.contains(node)) continue;
-            processNodeAgainstSelectors(node, selectors);
-        }
-    }
-
-    // Main engine runner (lazy loads rules and starts observers)
-    async function runEngine() {
-        // concurrency guard: avoid overlapping runs
-        if (state.isRunning) {
-            debugLog('runEngine already running — skipping');
-            return;
-        }
-        state.isRunning = true;
-
-        try {
-            // cleanup first
-            cleanup();
-
-            // global disable
-            if (CONFIG.disable_script === true) {
-                console.warn('🚫 Script globally disabled. Engine will not run.');
-                return;
-            }
-
-            // check per-domain global disable list
-            const disableListRaw = CONFIG.disable_script_websites || "";
-            if (disableListRaw && String(disableListRaw).trim()) {
-                const parts = String(disableListRaw).split(',').map(x => x.trim()).filter(Boolean);
-                for (const p of parts) {
-                    if (domainMatches(p, window.location.href)) {
-                        console.warn(`⛔ Deletion engine disabled for this domain via disable_script_websites: ${p}`);
-                        return;
-                    }
-                }
-            }
-
-            // LOAD RULE INDEX: parse deletion_rules now (lazy: only on refresh/run)
-            const allRules = await loadAllRulesArray(); // returns array of rule objects
-            // Build a small index of rule metadata (domain, id, name, enabled)
-            const ruleIndex = allRules.map(r => ({
-                id: r.id || null,
-                name: r.name || null,
-                domain: r.domain || '',
-                enabled: (r.enabled === undefined) ? true : Boolean(r.enabled)
-            }));
-
-            // determine matching rules for this URL (we will only "expand" those)
-            const matchedRules = [];
-            const currentHref = window.location.href;
-            for (let i = 0; i < allRules.length; i++) {
-                const r = allRules[i];
-                if (!r) continue;
-                const enabled = (r.enabled === undefined) ? true : Boolean(r.enabled);
-                if (!enabled) continue; // skip disabled rules
-                if (!r.domain) continue;
-                if (domainMatches(r.domain, currentHref)) {
-                    matchedRules.push(r);
-                }
-            }
-
-            // update last seen URL so watchers can compare later
-            state.lastUrl = currentHref;
-
-            if (matchedRules.length === 0) {
-                debugLog('ℹ️ No matching rules for this URL after lazy index check.');
-                setupUrlWatcher(); // keep watching for URL changes
-                return;
-            }
-
-            debugLog(`✅ Expanding ${matchedRules.length} matching rule(s) for this URL.`);
-
-            // normalize selectors for matched rules
-            // normalize selectors for matched rules (new format: rule.selectors[])
-            const onceSel = [];
-            const foreverSel = [];
-
-            for (const r of matchedRules) {
-                if (!Array.isArray(r.selectors)) continue;
-
-                for (const item of r.selectors) {
-                    const normalized = normalizeSelectorItem(item, r);
-                    if (!normalized) continue;
-
-                    if (item.mode === "once") {
-                        onceSel.push(normalized);
-                    } else {
-                        // default to forever if unspecified
-                        foreverSel.push(normalized);
-                    }
-                }
-            }
-
-
-            // dedupe
-            const onceList = dedupeSelectors(onceSel);
-            const foreverList = dedupeSelectors(foreverSel);
-
-            state.onceList = onceList;
-            state.foreverList = foreverList;
-
-            // initial sweep (combined)
-            const combined = [...onceList, ...foreverList];
-            if (combined.length > 0) {
-                debugLog(`🧹 Running initial sweep of ${combined.length} selectors.`);
-                deleteElements(combined);
-            }
-
-            // Setup node-processing functions (debounced) that process pending sets
-            const mutationDelay = Number(CONFIG.mutation_debounce_interval || SETTINGS_DEFAULTS.mutation_debounce_interval);
-
-            // forever processor
-            state.processForeverDebounced = debounce(() => processPendingNodes(state.pendingForever, state.foreverList), mutationDelay);
-
-            // once processor
-            state.processOnceDebounced = debounce(() => processPendingNodes(state.pendingOnce, state.onceList), mutationDelay);
-
-            // small safety threshold for huge mutation records
-            const MAX_MUTATION_NODES = 1000;
-
-            // create forever observer only if needed
-            if (state.foreverList.length > 0) {
-                const foreverObserver = new MutationObserver((records) => {
-                    try {
-                        for (const rec of records) {
-                            // safety guard
-                            if (rec.addedNodes && rec.addedNodes.length > MAX_MUTATION_NODES) {
-                                debugLog('⚠️ Skipping large mutation record (too many added nodes).');
-                                continue;
-                            }
-                            if (rec.addedNodes && rec.addedNodes.length) {
-                                for (const n of rec.addedNodes) {
-                                    if (n.nodeType === Node.ELEMENT_NODE) state.pendingForever.add(n);
-                                }
-                            }
-                            if (rec.type === 'attributes' && rec.target && rec.target.nodeType === Node.ELEMENT_NODE) {
-                                state.pendingForever.add(rec.target);
-                            }
-                        }
-                        // schedule processing via debounced function
-                        if (state.processForeverDebounced) state.processForeverDebounced();
-                    } catch (e) {
-                        // defensive - don't let observer throw
-                        debugLog('Error in foreverObserver callback', e && e.message);
-                    }
-                });
-                try {
-                    foreverObserver.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: [] });
-                    state.observers.push(foreverObserver);
-                    debugLog(`♻️ Forever observer started for ${state.foreverList.length} selectors.`);
-                } catch (e) {
-                    console.warn('⚠️ Failed to start forever observer', e);
-                }
-            }
-
-            // create once observer only if needed
-            if (state.onceList.length > 0) {
-                const onceObserver = new MutationObserver((records) => {
-                    try {
-                        for (const rec of records) {
-                            if (rec.addedNodes && rec.addedNodes.length > MAX_MUTATION_NODES) {
-                                debugLog('⚠️ Skipping large mutation record (too many added nodes).');
-                                continue;
-                            }
-                            if (rec.addedNodes && rec.addedNodes.length) {
-                                for (const n of rec.addedNodes) {
-                                    if (n.nodeType === Node.ELEMENT_NODE) state.pendingOnce.add(n);
-                                }
-                            }
-                            if (rec.type === 'attributes' && rec.target && rec.target.nodeType === Node.ELEMENT_NODE) {
-                                state.pendingOnce.add(rec.target);
-                            }
-                        }
-                        if (state.processOnceDebounced) state.processOnceDebounced();
-                    } catch (e) {
-                        debugLog('Error in onceObserver callback', e && e.message);
-                    }
-                });
-                try {
-                    onceObserver.observe(document.body || document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: [] });
-                    state.observers.push(onceObserver);
-                    debugLog(`🕒 Once observer started for ${state.onceList.length} selectors.`);
-                } catch (e) {
-                    console.warn('⚠️ Failed to start once observer', e);
-                }
-
-                // ensure once observer stops after max 3 seconds
-                setTimeout(() => {
-                    try { onceObserver.disconnect(); } catch (e) { }
-                    state.observers = state.observers.filter(o => o !== onceObserver);
-                    state.pendingOnce.clear();
-                    debugLog('🛑 Once observer stopped (max duration reached).');
-                }, 3000);
-            }
-
-            // finally, start URL watcher
-            setupUrlWatcher();
-        } finally {
-            state.isRunning = false;
-        }
-    }
-
-    /* -----------------------
-       URL WATCHER
-    ------------------------*/
-    function setupUrlWatcher() {
-        // clear old watcher and listeners if exists (we rebuild index every refresh anyway)
-        if (state.urlWatcherId) {
-            clearInterval(state.urlWatcherId);
-            state.urlWatcherId = null;
-        }
-        // remove any url listeners stored
-        if (state._urlListeners && state._urlListeners.length) {
-            for (const { type, fn, opts } of state._urlListeners) {
-                try { window.removeEventListener(type, fn, opts); } catch (e) { }
-            }
-            state._urlListeners = [];
-        }
-        // disconnect any SPA observers we previously created & clear array (they're also kept in state.observers)
-        for (const obs of state._spaObservers || []) {
-            try { obs.disconnect(); } catch (e) { }
-        }
-        state._spaObservers = [];
-
-        // helper to run when URL change is detected (debounced)
-        const debMs = Number(CONFIG.url_debounce_interval || SETTINGS_DEFAULTS.url_debounce_interval);
-        const onUrlChange = debounce(() => {
-            try {
-                if (window.location.href !== state.lastUrl) {
-                    debugLog('🔄 Detected URL change — re-running engine (lazy reload).');
-                    runEngine();
-                }
+                const s = ruleManager.getSettings();
+                if (!s?.toastsEnabled) return; // respect setting
             } catch (e) {
-                debugLog('onUrlChange error', e && e.message);
+                // if settings read fails, fall back to showing toast
             }
-        }, Math.max(50, debMs));
-
-        // If periodic check is enabled, use interval polling (original behavior)
-
-
-        // If periodic check is disabled, we rely on event-based SPA detection:
-        debugLog('URL periodic check disabled via settings. Using SPA/event-based detection.');
-
-        // 1) popstate and hashchange
-        const popFn = () => onUrlChange();
-        window.addEventListener('popstate', popFn, true);
-        window.addEventListener('hashchange', popFn, true);
-        state._urlListeners.push({ type: 'popstate', fn: popFn, opts: true }, { type: 'hashchange', fn: popFn, opts: true });
-
-        // 2) patch history.pushState/replaceState to detect SPA navigations
-        tryPatchHistory(onUrlChange);
-
-        // 3) lightweight MutationObservers:
-        // - Observe <head> childList for title or head-based router changes
-        // - Observe <body> attributes (class changes, data-route attributes) which some routers use
-        try {
-            const head = document.head || document.querySelector('head');
-            if (head) {
-                const headObserver = new MutationObserver((records) => {
-                    for (const rec of records) {
-                        // if title changed or nodes added/removed in head, check url
-                        if (rec.type === 'childList') {
-                            onUrlChange();
-                        }
-                    }
-                });
-                headObserver.observe(head, { childList: true, subtree: false });
-                state._spaObservers.push(headObserver);
-                state.observers.push(headObserver);
-            }
-
-            const body = document.body || document.documentElement;
-            if (body) {
-                const bodyAttrObserver = new MutationObserver((records) => {
-                    for (const rec of records) {
-                        // attribute changes may indicate SPA navigation (class/name/data-* changes)
-                        if (rec.type === 'attributes') {
-                            onUrlChange();
-                        }
-                    }
-                });
-                // Observe attributes on body only (cheap)
-                bodyAttrObserver.observe(body, { attributes: true, attributeFilter: [], subtree: false });
-                state._spaObservers.push(bodyAttrObserver);
-                state.observers.push(bodyAttrObserver);
-            }
-        } catch (e) {
-            debugLog('⚠️ Failed to setup SPA mutation observers', e && e.message);
+            const el = document.createElement("div");
+            el.className = `wa-toast ${type === "success" ? "success" : (type === "error" ? "error" : "")}`;
+            el.textContent = msg;
+            toastWrap.appendChild(el);
+            setTimeout(() => {
+                el.style.transition = "opacity 200ms";
+                el.style.opacity = "0";
+                setTimeout(() => el.remove(), 220);
+            }, ms);
         }
-    }
 
-    // helper to patch history methods (and store originals for cleanup)
-    function tryPatchHistory(onUrlChangeFn) {
-        try {
-            if (!state._historyPatched) {
-                state._originalHistory = {
-                    pushState: history.pushState,
-                    replaceState: history.replaceState
-                };
-                history.pushState = function (...args) {
-                    // call original
-                    const res = state._originalHistory.pushState.apply(this, args);
-                    try { onUrlChangeFn(); } catch (e) { }
-                    return res;
-                };
-                history.replaceState = function (...args) {
-                    const res = state._originalHistory.replaceState.apply(this, args);
-                    try { onUrlChangeFn(); } catch (e) { }
-                    return res;
-                };
-                state._historyPatched = true;
+        // Confirmation dialog (returns Promise<boolean>)
+        function confirmDialog(title, message) {
+            return new Promise((resolve) => {
+                const modal = document.createElement("div");
+                modal.className = "wa-editor-modal";
+                modal.innerHTML = `
+        <div class="wa-editor-window" style="width:420px;">
+          <div class="wa-editor-header">
+            <div style="font-weight:700;">${title}</div>
+          </div>
+          <div class="wa-card wa-confirm">
+            <div>${message}</div>
+            <div style="display:flex; gap:8px; justify-content:flex-end;">
+              <button class="wa-btn" data-action="cancel">Cancel</button>
+              <button class="wa-btn primary" data-action="ok">OK</button>
+            </div>
+          </div>
+        </div>
+      `;
+                shadow.appendChild(modal);
+                qS(modal, '[data-action="cancel"]').addEventListener("click", () => { modal.remove(); resolve(false); });
+                qS(modal, '[data-action="ok"]').addEventListener("click", () => { modal.remove(); resolve(true); });
+            });
+        }
+
+        // Render helpers for each main tab
+        const mainPane = qS(panel, "[data-pane]");
+        function clearMain() { mainPane.innerHTML = ""; }
+
+        // Build Status tab
+        function renderStatusTab() {
+            clearMain();
+            const s = getSettings();
+            const cfg = s.deletionSettings || {};
+            const domain = location.href;
+            const container = document.createElement("div");
+            const cardStatus = document.createElement("div");
+            cardStatus.className = "wa-card";
+            cardStatus.innerHTML = `
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <div style="font-weight:700">Script</div>
+        <div class="wa-small">Enable or disable deletion engine</div>
+      </div>
+      <div>
+        <label class="wa-toggle">
+          <input type="checkbox" id="wa-script-toggle" ${!cfg.scriptDisabled ? "checked" : ""}/>
+          <span class="wa-small">${!cfg.scriptDisabled ? "Enabled" : "Disabled"}</span>
+        </label>
+      </div>
+    </div>
+  `;
+            container.appendChild(cardStatus);
+
+            qS(cardStatus, "#wa-script-toggle").addEventListener("change", async (ev) => {
+                const checked = ev.target.checked;
+                const st = ruleManager.getSettings();
+                st.deletionSettings = st.deletionSettings || {};
+                st.deletionSettings.scriptDisabled = !checked;
+                ruleManager.setSettings(st);
+                toast(`Script ${checked ? "enabled" : "disabled"}`, "success");
+                if (checked) engine.start(); else engine.stop();
+            });
+
+            const cardRules = document.createElement("div");
+            cardRules.className = "wa-card";
+            cardRules.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Active rules for page</div>`;
+            const listWrap = document.createElement("div");
+            listWrap.className = "wa-list";
+            const allRules = ruleManager.getAllRules() || [];
+
+            const activeRules = allRules.filter(r => r && domainMatches(r.domain, location.href));
+            if (!activeRules.length) {
+                listWrap.innerHTML = `<div class="wa-small">No rules match this page</div>`;
             } else {
-                // already patched; still call onUrlChange when needed
+                for (const r of activeRules) {
+                    const rc = document.createElement("div");
+                    rc.className = "wa-rule-card";
+                    const meta = document.createElement("div");
+                    meta.className = "wa-rule-meta";
+                    const name = document.createElement("div"); name.textContent = r.name || r.domain || r.ID;
+                    const counts = document.createElement("div"); counts.className = "wa-small";
+                    // Show per-session count instead of total
+                    const perLoad = perLoadCounts.get(r.ID) || 0;
+                    counts.textContent = `Deleted this load: ${perLoad}`;
+                    meta.appendChild(name); meta.appendChild(counts);
+
+                    const controls = document.createElement("div");
+                    controls.style.display = "flex"; controls.style.gap = "8px"; controls.style.alignItems = "center";
+                    const toggle = document.createElement("input");
+                    toggle.type = "checkbox";
+                    toggle.checked = !!r.ruleEnabled;
+                    toggle.title = "Enable/Disable this rule";
+                    toggle.addEventListener("change", async (ev) => {
+                        const newVal = !!ev.target.checked;
+
+                        ruleManager.updateRuleByID(r.ID, { ruleEnabled: newVal });
+                        toast(`Rule "${r.name || r.domain}" ${newVal ? "enabled" : "disabled"}`, "success");
+
+                        await engine.restart?.();
+                        renderCurrentTab();
+                    });
+                    controls.appendChild(toggle);
+                    rc.appendChild(meta); rc.appendChild(controls);
+                    listWrap.appendChild(rc);
+                }
             }
-        } catch (e) {
-            debugLog('⚠️ Failed to patch history methods', e && e.message);
+            cardRules.appendChild(listWrap);
+            container.appendChild(cardRules);
+
+            mainPane.appendChild(container);
         }
-    }
 
-    // Self-contained UI module. Exposed as window.__vm_ui for external use.
-    async function initUI() {
-        const UI = (function () {
-            const ROOT_ID = 'vm-ui-root';
-            const FLOAT_BTN_ID = 'vm-floating-btn';
-            const MAIN_WIN_ID = 'vm-main-window';
-            const POPUP_CONTAINER_ID = 'vm-popup-container';
-            const TOAST_CONTAINER_ID = 'vm-toast-container';
-            const RULES_KEY = 'deletion_rules';
-            const STYLE_ID = 'vm-ui-styles';
-            const ANIM = { speed: 180 };
-            const THEME_FADE_MS = 150;
 
-            const el = (tag, attrs = {}, ...kids) => {
-                const node = document.createElement(tag);
-                for (const k of Object.keys(attrs || {})) {
-                    if (k === 'style') Object.assign(node.style, attrs[k]);
-                    else if (k.startsWith('on') && typeof attrs[k] === 'function') node.addEventListener(k.slice(2), attrs[k]);
-                    else if (k === 'dataset') Object.assign(node.dataset, attrs[k]);
-                    else node.setAttribute(k, attrs[k]);
+        // Rules tab rendering: search + Add + Pick element + rule list
+        function renderRulesTab() {
+            clearMain();
+            const container = document.createElement("div");
+
+            // Top controls card
+            const topCard = document.createElement("div");
+            topCard.className = "wa-card";
+            topCard.innerHTML = `
+      <div style="display:flex;gap:8px;align-items:center;">
+        <input class="wa-input" placeholder="Search rules..." id="wa-rule-search" />
+        <button class="wa-btn primary" id="wa-add-rule">Add Rule</button>
+        <button class="wa-btn" id="wa-pick-element">Pick Element</button>
+      </div>
+    `;
+            container.appendChild(topCard);
+
+            // Rule list card
+            const listCard = document.createElement("div");
+            listCard.className = "wa-card";
+            listCard.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Rules</div><div id="wa-rules-list" class="wa-list"></div>`;
+            container.appendChild(listCard);
+
+            mainPane.appendChild(container);
+
+            // Hooks
+            qS(topCard, "#wa-add-rule").addEventListener("click", () => openEditor("add", null));
+            qS(topCard, "#wa-pick-element").addEventListener("click", async () => {
+                // Start quick picker mode: highlight hover, click to capture selector and open editor with appended selector
+                startElementPicker();
+            });
+
+            // Render list
+            function refreshList(filter = "") {
+                const listWrap = qS(listCard, "#wa-rules-list");
+                listWrap.innerHTML = "";
+                const allRules = (ruleManager.getAllRules() || []).slice().reverse(); // show newest first
+                const f = String(filter || "").trim().toLowerCase();
+                for (const r of allRules) {
+                    if (!r) continue;
+                    const nameStr = (r.name || r.domain || r.ID).toLowerCase();
+                    if (f && !nameStr.includes(f) && !String(r.domain || "").toLowerCase().includes(f)) continue;
+                    const el = document.createElement("div");
+                    el.className = "wa-rule-card";
+                    const meta = document.createElement("div"); meta.className = "wa-rule-meta";
+                    meta.innerHTML = `<div style="font-weight:700">${r.name || r.domain}</div>
+                          <div class="wa-small">${r.domain}</div>
+                          <div class="wa-small">Temp: ${(r.tempSelectors || []).length} • Perm: ${(r.permanentSelectors || []).length}</div>`;
+                    const actions = document.createElement("div");
+                    actions.style.display = "flex"; actions.style.gap = "6px";
+                    const toggle = document.createElement("input"); toggle.type = "checkbox"; toggle.checked = !!r.ruleEnabled;
+                    toggle.title = "Enable/Disable rule";
+                    toggle.addEventListener("change", async (ev) => {
+                        const newVal = !!ev.target.checked;
+                        ruleManager.updateRuleByID(r.ID, { ruleEnabled: newVal });
+                        toast(`Rule "${r.name || r.domain}" ${newVal ? "enabled" : "disabled"}`, "success");
+                        await engine.restart?.();
+                        refreshList(qS(topCard, "#wa-rule-search").value);
+                    });
+                    const btnEdit = document.createElement("button"); btnEdit.className = "wa-btn"; btnEdit.textContent = "Edit";
+                    btnEdit.addEventListener("click", () => openEditor("edit", r));
+                    const btnDelete = document.createElement("button"); btnDelete.className = "wa-btn"; btnDelete.textContent = "Delete";
+                    btnDelete.addEventListener("click", async () => {
+                        const ok = await confirmDialog("Delete rule", `Delete rule "${r.name || r.domain}"?`);
+                        if (!ok) return;
+                        ruleManager.removeRuleByID(r.ID);
+                        toast("Rule deleted", "success");
+                        await engine.restart?.();
+                        refreshList(qS(topCard, "#wa-rule-search").value);
+                    });
+                    actions.appendChild(toggle);
+                    actions.appendChild(btnEdit);
+                    actions.appendChild(btnDelete);
+                    el.appendChild(meta); el.appendChild(actions);
+                    listWrap.appendChild(el);
                 }
-                for (const c of kids) {
-                    if (c == null) continue;
-                    if (typeof c === 'string' || typeof c === 'number') node.appendChild(document.createTextNode(String(c)));
-                    else node.appendChild(c);
-                }
-                return node;
-            };
-            const q = s => document.querySelector(s);
-            function clamp(val, min, max) { return Math.max(min, Math.min(max, val)); }
-            // small debounce used by UI
-            function simpleDebounce(fn, ms = 150) {
-                let t = null;
-                return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
             }
 
+            qS(topCard, "#wa-rule-search").addEventListener("input", (ev) => refreshList(ev.target.value));
+            refreshList();
+        }
 
-            function ensureStyles() {
-                if (document.getElementById(STYLE_ID)) return;
+        // Stats tab
+        function renderStatsTab() {
+            clearMain();
+            const s = getSettings();
+            const container = document.createElement("div");
 
-                const css = `:root {
-  --vm-accent: ${CONFIG.accent_color || 'darkblue'};
-  /* GitHub Dark palette + light defaults */
-  --vm-bg: ${CONFIG.theme_mode === 'dark' ? '#0d1117' : '#ffffff'};
-  --vm-card: ${CONFIG.theme_mode === 'dark' ? '#161b22' : '#fbfbfd'};
-  --vm-fg: ${CONFIG.theme_mode === 'dark' ? '#c9d1d9' : '#071018'};
-  --vm-muted: ${CONFIG.theme_mode === 'dark' ? '#8b949e' : '#66787f'};
-  --vm-border: ${CONFIG.theme_mode === 'dark' ? '#30363d' : 'rgba(0,0,0,0.06)'};
-  --vm-shadow: rgba(3,7,18,0.18);
-  --vm-radius: 12px;
-  --vm-trans: ${ANIM.speed}ms;
-  --vm-z: 2147483000;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
-}
-#${ROOT_ID} {
-position: fixed;
-inset: 0;
-width: 0 !important;
-height: 0 !important;
-pointer-events: none;
-overflow: visible;
-z-index: var(--vm-z);
-}
+            const card1 = document.createElement("div"); card1.className = "wa-card";
+            const totalDeleted = (ruleManager.getAllRules() || []).reduce((acc, r) => acc + (Number(r.tempDeleteCount || 0) + Number(r.permanentDeleteCount || 0)), 0);
+            card1.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;">
+        <div>
+          <div style="font-weight:700">Statistics</div>
+          <div class="wa-small">Enable/disable stats collection</div>
+        </div>
+        <div>
+          <label class="wa-toggle">
+            <input type="checkbox" id="wa-stats-toggle" ${s.statsEnabled ? "checked" : ""}/>
+            <span class="wa-small">${s.statsEnabled ? "On" : "Off"}</span>
+          </label>
+        </div>
+      </div>
+      <div style="margin-top:8px;">Total deletions (all rules): <strong>${totalDeleted}</strong></div>
+      <div style="margin-top:8px;"><button class="wa-btn" id="wa-reset-counters">Reset all counters</button></div>
+    `;
+            container.appendChild(card1);
 
+            qS(card1, "#wa-stats-toggle").addEventListener("change", async (ev) => {
+                const newVal = !!ev.target.checked;
+                const st = ruleManager.getSettings();
+                st.statsEnabled = newVal;
+                ruleManager.setSettings(st);
+                toast(`Stats ${newVal ? "enabled" : "disabled"}`, "success");
+            });
+            qS(card1, "#wa-reset-counters").addEventListener("click", async () => {
+                const ok = await confirmDialog("Reset counters", "Reset all deletion counters to zero?");
+                if (!ok) return;
+                const all = ruleManager.getAllRules() || [];
+                for (const r of all) {
+                    ruleManager.updateRuleByID(r.ID, { tempDeleteCount: 0, permanentDeleteCount: 0 });
+                }
+                toast("Counters reset", "success");
+                renderStatsTab();
+            });
 
-#${ROOT_ID} .vm-main-window,
-#${ROOT_ID} .vm-popup-backdrop,
-#${ROOT_ID} .vm-popup,
-#${ROOT_ID} .toast-area,
-#${ROOT_ID} .toast,
-#${ROOT_ID} .vm-card,
-#${ROOT_ID} .rules-list,
-#${ROOT_ID} .rule-row,
-#${ROOT_ID} button,
-#${ROOT_ID} input,
-#${ROOT_ID} select,
-#${ROOT_ID} textarea {
-pointer-events: auto !important;
-}
+            // Table of rules and counts
+            const card2 = document.createElement("div"); card2.className = "wa-card";
+            card2.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Per-rule counts</div><div id="wa-stats-table"></div>`;
+            container.appendChild(card2);
 
-#${ROOT_ID} * { box-sizing: border-box; }
-
-
-.vm-floating-button {
-  position: fixed;
-  right: 22px;
-  bottom: 22px;
-  width: 56px;
-  height: 56px;
-  border-radius: 14px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  pointer-events: auto;
-  box-shadow: 0 8px 24px var(--vm-shadow);
-  backdrop-filter: blur(6px);
-  border: 1px solid rgba(0,0,0,0.06);
-  transition: transform var(--vm-trans) ease, box-shadow var(--vm-trans) ease, background-color var(--vm-trans) ease;
-  background-color: var(--vm-accent);
-  color: white;
-}
-.vm-floating-button:hover { transform: translateY(-4px) scale(1.02); box-shadow: 0 12px 32px rgba(3,7,18,0.24); }
-
-
-.vm-main-window {  position: fixed;  z-index: calc(var(--vm-z) + 100);  right: 22px;  bottom: 90px;  width: 740px;  max-width: calc(100vw - 48px);  height: 520px;  max-height: calc(100vh - 80px);  border-radius: var(--vm-radius);  background-color: var(--vm-bg);  color: var(--vm-fg);  pointer-events: auto;  overflow: hidden;  box-shadow: 0 20px 60px rgba(2,6,23,0.6);  display: flex;  flex-direction: column;  transform-origin: bottom right;  transform: scale(0.92);  opacity: 0;  transition: transform var(--vm-trans) cubic-bezier(.2,.9,.3,1), opacity var(--vm-trans) ease;  border: 1px solid var(--vm-border);}
-
-
-.vm-main-window.vm-theme-fade { transition: opacity ${THEME_FADE_MS}ms ease; opacity: 0.6; }
-
-.vm-main-window.open { transform: scale(1); opacity: 1; }
-
-
-.vm-header, .vm-card, .vm-tab {
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-.vm-header {
-  padding: 16px 18px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  border-bottom: 1px solid var(--vm-border);
-  background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
-}
-
-.vm-title { font-weight: 700; font-size: 16px; color: var(--vm-fg); }
-.vm-tabs { margin-left: auto; display:flex; gap:8px; }
-.vm-tab {
-  padding: 8px 12px; border-radius: 10px; font-size:13px; cursor: pointer;
-  color: var(--vm-muted); background: transparent; border: none;
-}
-.vm-tab.active {
-  background: rgba(255,255,255,0.02); color: var(--vm-fg); box-shadow: inset 0 -2px 0 var(--vm-accent);
-}
-
-.vm-body { padding: 14px; overflow: auto; display: grid; grid-template-columns: 1fr; gap:12px; }
-
-.vm-card {
-  background: var(--vm-card);
-  border-radius: 10px;
-  padding: 12px;
-  box-shadow: 0 6px 18px rgba(2,6,23,0.15);
-  border: 1px solid var(--vm-border);
-}
-
-/* status */
-.vm-stats { display:flex; gap:12px; align-items:center; }
-.stat { flex:1; padding:12px; border-radius:10px; background: linear-gradient(180deg, rgba(255,255,255,0.01), rgba(0,0,0,0.02)); }
-.stat .num { font-size: 20px; font-weight:700; color:var(--vm-fg); }
-.stat .label { font-size:12px; color:var(--vm-muted); }
-
-/* rules list */
-.rules-list { display:flex; flex-direction:column; gap:8px; max-height: 340px; overflow:auto; }
-.rule-row { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:8px; border-radius:8px; background: rgba(0,0,0,0.01); }
-.rule-meta { display:flex; gap:12px; align-items:center; }
-.rule-title { font-weight:600; }
-.rule-domain { font-size:12px; color:var(--vm-muted); }
-
-/* settings layout */
-.settings-grid { display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
-.setting { display:flex; flex-direction:column; gap:6px; }
-.vm-controls { display:flex; gap:8px; align-items:center; }
-
-/* buttons */
-.vm-btn {
-  padding:8px 12px; border-radius:8px; border:none; cursor:pointer; font-weight:600;
-  background:var(--vm-accent); color:#fff;
-  transition: transform var(--vm-trans) ease, opacity var(--vm-trans) ease;
-}
-.vm-btn.ghost { background: transparent; color: var(--vm-fg); border: 1px solid rgba(255,255,255,0.04); }
-
-/* toggles - improved contrast and theme-aware visuals */
-.vm-toggle {
-  width:44px; height:26px; border-radius:14px; position:relative; cursor:pointer;
-  display:inline-block; border: 1px solid var(--vm-border);
-  transition: background-color 0.12s ease, border-color 0.12s ease;
-  background: ${CONFIG.theme_mode === 'dark' ? '#30363d' : 'rgba(0,0,0,0.08)'};
-}
-.vm-toggle .knob {
-  position:absolute; left:4px; top:3px; width:20px; height:20px; border-radius:11px;
-  background: ${CONFIG.theme_mode === 'dark' ? '#f0f6fc' : '#4b5563'};
-  transition: left var(--vm-trans) ease, background-color 0.12s ease, box-shadow 0.12s ease;
-  box-shadow: 0 2px 6px rgba(2,6,23,0.12);
-}
-.vm-toggle.on { background: var(--vm-accent); }
-.vm-toggle.on .knob { left: 20px; }
-
-/* popup & toast */
-#${POPUP_CONTAINER_ID} {
-position: fixed;
-right: 0; bottom: 0; left: 0; top: 0;
-pointer-events: none;
-z-index: calc(var(--vm-z) + 200);
-}
-
-.vm-popup-backdrop { position:absolute; inset:0; background: rgba(2,6,23,0.45); display:flex; align-items:center; justify-content:center; pointer-events:auto; }
-.vm-popup { width:520px; max-width:calc(100% - 60px); border-radius:12px; padding:16px; background:var(--vm-card); color:var(--vm-fg); box-shadow: 0 30px 80px rgba(2,6,23,0.6); }
-
-
-.toast-area { position: fixed; right: 22px; bottom: 22px; display:flex; flex-direction:column; gap:8px; align-items:flex-end; z-index: calc(var(--vm-z) + 3); pointer-events:none; }
-.toast { padding:10px 14px; border-radius:10px; background: rgba(0,0,0,0.7); color:#fff; pointer-events:auto; transform-origin: right bottom; opacity:0; transform: translateY(12px); transition: transform 220ms ease, opacity 220ms ease; }
-.toast.show { opacity:1; transform: translateY(0); }
-
-/* Global input/textarea styling so text boxes follow theme (fix for white boxes in dark mode) */
-#${ROOT_ID} input, #${ROOT_ID} textarea, #${ROOT_ID} select {
-  background: var(--vm-card);
-  color: var(--vm-fg);
-  border: 1px solid var(--vm-border);
-  padding: 8px;
-  border-radius: 8px;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-#${ROOT_ID} input:focus, #${ROOT_ID} textarea:focus, #${ROOT_ID} select:focus {
-  outline: none;
-  border-color: var(--vm-accent);
-  box-shadow: 0 4px 18px rgba(31,78,216,0.06);
-}
-
-
-@media (max-width: 820px) {
-  .vm-main-window { width: calc(100vw - 32px); right: 16px; left: 16px; bottom: 60px; }
-}`;
-
-                const s = document.createElement('style');
-                s.id = STYLE_ID;
-                s.textContent = css;
-                document.head.appendChild(s);
+            const table = document.createElement("table");
+            table.style.width = "100%";
+            table.innerHTML = `<thead><tr><th style="text-align:left">Name</th><th style="text-align:left">Domain</th><th style="text-align:right">Deletions</th></tr></thead>`;
+            const tbody = document.createElement("tbody");
+            const all = ruleManager.getAllRules() || [];
+            for (const r of all) {
+                const tr = document.createElement("tr");
+                tr.innerHTML = `<td>${r.name || ""}</td><td class="wa-small">${r.domain || ""}</td><td style="text-align:right">${(Number(r.tempDeleteCount || 0) + Number(r.permanentDeleteCount || 0))}</td>`;
+                tbody.appendChild(tr);
             }
-            function applyThemeVars({ fade = true } = {}) {
-                const root = document.documentElement;
-                root.style.setProperty('--vm-accent', CONFIG.accent_color || SETTINGS_DEFAULTS.accent_color);
-                if (CONFIG.theme_mode === 'dark') {
-                    root.style.setProperty('--vm-bg', '#0d1117');
-                    root.style.setProperty('--vm-card', '#161b22');
-                    root.style.setProperty('--vm-fg', '#c9d1d9');
-                    root.style.setProperty('--vm-muted', '#8b949e');
-                    root.style.setProperty('--vm-border', '#30363d');
-                } else {
-                    root.style.setProperty('--vm-bg', '#ffffff');
-                    root.style.setProperty('--vm-card', '#fbfbfd');
-                    root.style.setProperty('--vm-fg', '#071018');
-                    root.style.setProperty('--vm-muted', '#66787f');
-                    root.style.setProperty('--vm-border', 'rgba(0,0,0,0.06)');
-                }
+            table.appendChild(tbody);
+            qS(card2, "#wa-stats-table").appendChild(table);
 
-                const s = document.getElementById(STYLE_ID);
-                if (s) {
-                    let cssText = s.textContent;
-                    cssText = cssText.replace(/(\.vm-toggle \{[\s\S]*?background:\s*)([^;]+)(;)/m, (m0, p1, p2, p3) => {
-                        const newBg = (CONFIG.theme_mode === 'dark') ? '#30363d' : 'rgba(0,0,0,0.08)';
-                        return p1 + newBg + p3;
-                    });
-                    cssText = cssText.replace(/(\.vm-toggle \.knob \{[\s\S]*?background:\s*)([^;]+)(;)/m, (m0, p1, p2, p3) => {
-                        const newKnob = (CONFIG.theme_mode === 'dark') ? '#f0f6fc' : '#4b5563';
-                        return p1 + newKnob + p3;
-                    });
-                    s.textContent = cssText;
-                }
+            mainPane.appendChild(container);
+        }
 
-                if (fade) {
-                    const win = document.getElementById(MAIN_WIN_ID);
-                    if (win) {
-                        win.classList.add('vm-theme-fade');
-                        setTimeout(() => {
-                            try { win.classList.remove('vm-theme-fade'); } catch (e) { }
-                        }, THEME_FADE_MS);
+        // Settings tab
+        function renderSettingsTab() {
+            clearMain();
+            const s = getSettings();
+            const container = document.createElement("div");
+
+            // -------------------------
+            // General card
+            // -------------------------
+            const general = document.createElement("div");
+            general.className = "wa-card";
+            general.innerHTML = `
+      <div style="font-weight:700">General</div>
+      <div style="margin-top:8px;">
+        <label class="wa-toggle">
+          <input type="checkbox" id="wa-settings-script" ${!s.deletionSettings?.scriptDisabled ? "checked" : ""}/>
+          <span class="wa-small">Script Enabled</span>
+        </label>
+      </div>
+      <div style="margin-top:8px;">
+        <label class="wa-toggle">
+          <input type="checkbox" id="wa-settings-toasts" ${s.toastsEnabled ? "checked" : ""}/>
+          <span class="wa-small">Toasts Enabled</span>
+        </label>
+      </div>
+    `;
+            container.appendChild(general);
+
+            qS(general, "#wa-settings-script").addEventListener("change", async (ev) => {
+                s.deletionSettings = s.deletionSettings || {};
+                s.deletionSettings.scriptDisabled = !ev.target.checked;
+                ruleManager.setSettings(s);
+                if (ev.target.checked) engine.start(); else engine.stop();
+                toast("General settings saved", "success");
+            });
+
+            qS(general, "#wa-settings-toasts").addEventListener("change", async (ev) => {
+                s.toastsEnabled = !!ev.target.checked;
+                ruleManager.setSettings(s);
+                toast("Toasts setting saved", "success");
+            });
+
+            // -------------------------
+            // THEME CARD (UPDATED)
+            // -------------------------
+            const themeCard = document.createElement("div");
+            themeCard.className = "wa-card";
+
+            const currentAccent =
+                s.theme?.mode === "dark"
+                    ? s.theme.dark.accent
+                    : s.theme.light.accent;
+
+            themeCard.innerHTML = `
+      <div style="font-weight:700">Theme</div>
+
+      <!-- Mode toggle -->
+      <div class="wa-row" style="margin-top:8px;">
+        <label class="wa-toggle">
+          <input type="radio" name="wa-theme-mode" value="light" ${s.theme?.mode !== "dark" ? "checked" : ""}/>
+          Light
+        </label>
+
+        <label class="wa-toggle" style="margin-left:8px;">
+          <input type="radio" name="wa-theme-mode" value="dark" ${s.theme?.mode === "dark" ? "checked" : ""}/>
+          Dark
+        </label>
+      </div>
+
+      <!-- Accent + presets -->
+      <div class="wa-row" style="margin-top:16px; align-items:center; gap:16px;">
+        <div style="font-weight:700; white-space:nowrap;">Accent Color</div>
+
+        <!-- Color picker -->
+        <input
+          type="color"
+          id="wa-theme-accent"
+          value="${currentAccent}"
+          style="width:42px;height:32px;padding:0;border:none;border-radius:8px;"
+        />
+
+        <!-- Preset buttons -->
+        <div style="display:flex; gap:8px; margin-left:auto; align-items:center;">
+          <span class="wa-small">Presets:</span>
+
+          <button class="wa-btn wa-preset-color" data-color="#5a8ead"
+            style="width:26px;height:26px;padding:0;border:none;background:#5a8ead;"></button>
+
+          <button class="wa-btn wa-preset-color" data-color="#ae79a7"
+            style="width:26px;height:26px;padding:0;border:none;background:#ae79a7;"></button>
+
+          <button class="wa-btn wa-preset-color" data-color="#662121"
+            style="width:26px;height:26px;padding:0;border:none;background:#662121;"></button>
+
+          <button class="wa-btn wa-preset-color" data-color="#4144be"
+            style="width:26px;height:26px;padding:0;border:none;background:#4144be;"></button>
+        </div>
+      </div>
+    `;
+
+            container.appendChild(themeCard);
+
+            // Theme mode switching
+            qSA(themeCard, 'input[name="wa-theme-mode"]').forEach(r =>
+                r.addEventListener("change", (ev) => {
+                    s.theme = s.theme || {};
+                    s.theme.mode = ev.target.value;
+                    ruleManager.setSettings(s);
+                    style.textContent = buildStyles();
+                    toast("Theme updated", "success");
+                })
+            );
+
+            // Accent color picker
+            qS(themeCard, "#wa-theme-accent").addEventListener("input", (ev) => {
+                const color = ev.target.value;
+
+                if (s.theme.mode === "dark") s.theme.dark.accent = color;
+                else s.theme.light.accent = color;
+
+                ruleManager.setSettings(s);
+                style.textContent = buildStyles();
+                toast("Accent color updated", "success");
+            });
+
+            // Preset buttons
+            qSA(themeCard, ".wa-preset-color").forEach(btn =>
+                btn.addEventListener("click", () => {
+                    const color = btn.dataset.color;
+
+                    if (s.theme.mode === "dark") s.theme.dark.accent = color;
+                    else s.theme.light.accent = color;
+
+                    qS(themeCard, "#wa-theme-accent").value = color;
+
+                    ruleManager.setSettings(s);
+                    style.textContent = buildStyles();
+                    toast("Accent color updated", "success");
+                })
+            );
+
+            // -------------------------
+            // Backup / Restore card
+            // -------------------------
+            const backup = document.createElement("div");
+            backup.className = "wa-card";
+            backup.innerHTML = `
+      <div style="font-weight:700">Backup / Restore</div>
+      <div style="margin-top:8px;">
+        <button class="wa-btn" id="wa-export">Export JSON</button>
+        <button class="wa-btn" id="wa-import">Import JSON</button>
+        <input type="file" id="wa-import-file" style="display:none" accept="application/json"/>
+      </div>
+    `;
+            container.appendChild(backup);
+
+            qS(backup, "#wa-export").addEventListener("click", () => {
+                const s = ruleManager.getSettings();
+                const blob = new Blob([JSON.stringify(s, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement("a");
+                a.href = url; a.download = "web_assassin_settings.json"; a.click();
+                URL.revokeObjectURL(url);
+                toast("Export started", "success");
+            });
+
+            qS(backup, "#wa-import").addEventListener("click", () =>
+                qS(backup, "#wa-import-file").click()
+            );
+
+            qS(backup, "#wa-import-file").addEventListener("change", (ev) => {
+                const f = ev.target.files && ev.target.files[0];
+                if (!f) return;
+
+                const reader = new FileReader();
+                reader.onload = async (e) => {
+                    try {
+                        const parsed = JSON.parse(e.target.result);
+                        const ok = await confirmDialog("Import settings", "This will overwrite settings. Continue?");
+                        if (!ok) return;
+                        ruleManager.setSettings(parsed);
+                        toast("Settings imported", "success");
+                        renderCurrentTab();
+                    } catch (err) {
+                        toast("Invalid JSON file", "error");
                     }
-                }
-            }
-
-            function ensureRoot() {
-                let root = document.getElementById(ROOT_ID);
-                if (root) return root;
-                root = el('div', { id: ROOT_ID });
-                const floatBtn = el('div', { id: FLOAT_BTN_ID, class: 'vm-floating-button', title: 'ViolentMonkey Deletion Engine' }, '☰');
-                root.appendChild(floatBtn);
-                const main = el('div', { id: MAIN_WIN_ID, class: 'vm-main-window' });
-                root.appendChild(main);
-                const popc = el('div', { id: POPUP_CONTAINER_ID });
-                const toastc = el('div', { id: TOAST_CONTAINER_ID, class: 'toast-area' });
-                root.appendChild(popc);
-                root.appendChild(toastc);
-                document.body.appendChild(root);
-                return root;
-            }
-
-            function showToast(message, opts = {}) {
-                try {
-                    if (CONFIG.notifications_active === false) return;
-                } catch (e) { /* fallthrough */ }
-
-                const c = q(`#${ROOT_ID} #${TOAST_CONTAINER_ID}`) || q(`#${ROOT_ID} .toast-area`);
-                if (!c) return;
-                const t = el('div', { class: 'toast vm-card' }, message);
-                c.appendChild(t);
-                requestAnimationFrame(() => t.classList.add('show'));
-                const timeout = (opts.timeout === undefined) ? 3500 : opts.timeout;
-                const id = setTimeout(() => {
-                    t.classList.remove('show');
-                    setTimeout(() => t.remove(), 220);
-                }, timeout);
-                t.addEventListener('click', () => {
-                    clearTimeout(id);
-                    t.classList.remove('show');
-                    setTimeout(() => t.remove(), 120);
-                });
-            }
-
-            function openPopup({ title = '', content = null, actions = [] } = {}) {
-                const popContainer = q(`#${ROOT_ID} #${POPUP_CONTAINER_ID}`) || q(`#${ROOT_ID}`);
-                if (!popContainer) return;
-                popContainer.innerHTML = '';
-                const backdrop = el('div', { class: 'vm-popup-backdrop' });
-                const box = el('div', { class: 'vm-popup' });
-                if (title) box.appendChild(el('div', { style: { fontWeight: 700, marginBottom: '8px' } }, title));
-                if (content) {
-                    if (typeof content === 'string') box.appendChild(el('div', {}, content));
-                    else box.appendChild(content);
-                }
-                const btnRow = el('div', { style: { marginTop: '12px', display: 'flex', gap: '8px', justifyContent: 'flex-end' } });
-                actions.forEach(a => {
-                    const cls = a.ghost ? 'vm-btn ghost' : 'vm-btn';
-                    const b = el('button', { class: cls, onclick: async () => { try { await a.onClick(); } catch (e) { } closePopup(); } }, a.label || 'OK');
-                    btnRow.appendChild(b);
-                });
-                box.appendChild(btnRow);
-                backdrop.appendChild(box);
-                popContainer.appendChild(backdrop);
-                function closePopup() { try { backdrop.remove(); } catch (e) { } }
-                backdrop.addEventListener('click', (ev) => { if (ev.target === backdrop) closePopup(); });
-                return { close: () => backdrop.remove() };
-            }
-
-            function createButton(label, opts = {}) {
-                const cls = opts.ghost ? 'vm-btn ghost' : 'vm-btn';
-                const btn = el('button', { class: cls });
-                btn.appendChild(document.createTextNode(label));
-                if (opts.title) btn.title = opts.title;
-                if (opts.onClick) btn.addEventListener('click', opts.onClick);
-                return btn;
-            }
-
-            function createToggle(initial = false, onChange) {
-                const wrap = el('div', { class: 'vm-toggle' });
-                const knob = el('div', { class: 'knob' });
-                wrap.appendChild(knob);
-                function setOn(v) { if (v) wrap.classList.add('on'); else wrap.classList.remove('on'); }
-                setOn(Boolean(initial));
-                wrap.addEventListener('click', () => {
-                    const newVal = !wrap.classList.contains('on');
-                    setOn(newVal);
-                    if (typeof onChange === 'function') onChange(newVal);
-                });
-                return { el: wrap, set: setOn };
-            }
-            function buildRuleRow(rule, idx, onEdit, onDelete, onToggle) {
-                const row = el('div', { class: 'rule-row vm-card' });
-                const meta = el('div', { class: 'rule-meta' });
-                const title = el('div', { class: 'rule-title' }, rule.name || `Rule ${idx + 1}`);
-                const domain = el('div', { class: 'rule-domain' }, rule.domain || '*');
-                meta.appendChild(title);
-                meta.appendChild(domain);
-
-                // Add deletion counts to the UI
-                const stats = el('div', { class: 'vm-stats' });
-                const onceCount = el('div', { class: 'stat once-count' }, el('div', { class: 'num' }, 0), el('div', { class: 'label' }, 'Deleted (once)'));
-                const foreverCount = el('div', { class: 'stat forever-count' }, el('div', { class: 'num' }, 0), el('div', { class: 'label' }, 'Deleted (forever)'));
-                stats.appendChild(onceCount);
-                stats.appendChild(foreverCount);
-                row.appendChild(meta);
-                row.appendChild(stats);
-
-                const controls = el('div', { class: 'vm-controls' });
-                const toggle = createToggle(Boolean(rule.enabled), (v) => { if (onToggle) onToggle(v); });
-                controls.appendChild(toggle.el);
-                controls.appendChild(createButton('Edit', { onClick: () => onEdit(rule, idx) }));
-                const del = createButton('Delete', { ghost: true, onClick: () => onDelete(rule, idx) });
-                controls.appendChild(del);
-
-                row.appendChild(controls);
-                return row;
-            }
-
-            function openRuleEditor({ rule = null, onSave } = {}) {
-                const r = rule ? JSON.parse(JSON.stringify(rule)) : { id: null, name: '', domain: window.location.hostname || '', enabled: true, delete_once: [], delete_forever: [] };
-                const container = el('div', {});
-                const form = el('div', { style: { display: 'grid', gap: '8px' } });
-                const nameInput = el('input', { style: { width: '100%', padding: '8px', borderRadius: '8px' }, value: r.name, placeholder: 'Rule name (optional)' });
-                const domainInput = el('input', { style: { width: '100%', padding: '8px', borderRadius: '8px' }, value: r.domain || '', placeholder: 'domain match (e.g. example.com or *.example.com)' });
-                const enabledToggleWrap = el('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } }, 'Enabled');
-                const enabledToggle = createToggle(Boolean(r.enabled), v => r.enabled = v);
-                enabledToggle.set(Boolean(r.enabled));
-                enabledToggleWrap.appendChild(enabledToggle.el);
-                if (!r.selectors) {
-                    r.selectors = [
-                        ...(r.selectors || []).map(s => ({ name: '', selector: s, mode: 'once' })),
-                        ...(r.selectors || []).map(s => ({ name: '', selector: s, mode: 'forever' }))
-                    ];
-                }
-
-                form.appendChild(el('div', {}, 'Name'));
-                form.appendChild(nameInput);
-                form.appendChild(el('div', {}, 'Domain (pattern)'));
-                form.appendChild(domainInput);
-                form.appendChild(enabledToggleWrap);
-                const selectorList = el('div', {
-                    className: 'selector-list',
-                    style: { display: 'flex', flexDirection: 'column', gap: '8px' }
-                });
-                function createSelectorRow(sel, onDelete) {
-                    const row = el('div', {
-                        className: 'selector-row',
-                        style: {
-                            display: 'grid',
-                            gridTemplateColumns: '1fr 1fr auto auto',
-                            gap: '8px',
-                            alignItems: 'center',
-                            padding: '6px 0'
-                        }
-                    });
-                    const nameInput = el('input', {
-                        type: 'text',
-                        value: sel.name || '',
-                        placeholder: 'Name',
-                        className: 'vm-input'
-                    });
-                    nameInput.oninput = () => sel.name = nameInput.value;
-                    const selectorInput = el('input', {
-                        type: 'text',
-                        value: sel.selector || '',
-                        placeholder: 'CSS selector',
-                        className: 'vm-input'
-                    });
-                    selectorInput.oninput = () => sel.selector = selectorInput.value;
-                    const modeToggle = (() => {
-                        const btn = createButton('', {
-                            onClick: () => {
-                                sel.mode = sel.mode === 'forever' ? 'once' : 'forever';
-                                update();
-                            }
-                        });
-                        btn.style.padding = '6px 12px';
-                        btn.style.fontSize = '13px';
-                        btn.style.minWidth = '86px';
-
-                        function update() {
-                            if (sel.mode === 'forever') {
-                                btn.textContent = 'Multiple';
-                                btn.classList.remove('ghost');
-                                btn.classList.add('primary'); // filled accent style
-                            } else {
-                                btn.textContent = 'Once';
-                                btn.classList.add('ghost');
-                                btn.classList.remove('primary');
-                            }
-                        }
-
-                        update();
-                        return { el: btn };
-                    })();
-
-
-
-                    // Delete icon
-                    const deleteBtn = el('button', {
-                        className: 'vm-btn ghost',
-                        style: { padding: '4px 8px', color: 'var(--vm-red)' }
-                    }, '🗑️');
-                    deleteBtn.onclick = () => {
-                        if (typeof onDelete === 'function') onDelete();
-                    };
-
-                    row.appendChild(nameInput);
-                    row.appendChild(selectorInput);
-                    row.appendChild(modeToggle.el);
-                    row.appendChild(deleteBtn);
-
-                    return row;
-                }
-
-
-                function renderSelectors() {
-                    selectorList.innerHTML = '';
-                    r.selectors.forEach((sel, index) => {
-                        selectorList.appendChild(createSelectorRow(sel, () => {
-                            r.selectors.splice(index, 1);
-                            renderSelectors();
-                        }));
-                    });
-                }
-
-                const addSelectorBtn = el('button', { className: 'vm-btn ghost' }, 'Add selector');
-                addSelectorBtn.onclick = () => {
-                    r.selectors.push({ name: '', selector: '', mode: 'once' });
-                    renderSelectors();
                 };
+                reader.readAsText(f);
+            });
 
-                form.appendChild(el('div', {}, 'Selectors'));
-                form.appendChild(selectorList);
-                form.appendChild(addSelectorBtn);
+            // -------------------------
+            // Deletion settings card
+            // -------------------------
+            const delCard = document.createElement("div");
+            delCard.className = "wa-card";
+            delCard.innerHTML = `
+      <div style="font-weight:700">Deletion settings</div>
+      <div style="margin-top:8px;">
+        <label class="wa-small">Mutation debounce (ms)</label>
+        <input class="wa-input" id="wa-mutation-debounce" type="number"
+          value="${s.deletionSettings?.mutationObserverDebounceInterval || 250}" />
+      </div>
 
-                renderSelectors();
+      <div style="margin-top:8px;">
+        <label class="wa-toggle">
+          <input type="checkbox" id="wa-periodic-url-check" ${s.deletionSettings?.peridoicURLCheck ? "checked" : ""}/>
+          periodic URL check
+        </label>
+      </div>
 
-                container.appendChild(form);
-                openPopup({
-                    title: rule ? 'Edit Rule' : 'Add Rule',
-                    content: container,
-                    actions: [
-                        { label: 'Cancel', ghost: true, onClick: async () => { } },
-                        {
-                            label: 'Save', onClick: async () => {
-                                const domainVal = domainInput.value.trim();
+      <div style="margin-top:8px;">
+        <label class="wa-small">Periodic URL check interval (ms)</label>
+        <input class="wa-input" id="wa-periodic-url-interval" type="number"
+          value="${s.deletionSettings?.peridoicURLCheckInterval || 5000}" />
+      </div>
 
-                                // 1. Empty domain → highlight + message, block save
-                                if (!domainVal) {
-                                    domainInput.style.border = '2px solid red';
-                                    showToast('Domain cannot be empty!', { timeout: 2000 });
-                                    return;
-                                } else {
-                                    domainInput.style.border = '';
-                                }
+      <div style="margin-top:8px;">
+        <button class="wa-btn primary" id="wa-save-deletion-settings">Save Deletion Settings</button>
+      </div>
+    `;
+            container.appendChild(delCard);
 
-                                const newRule = {
-                                    id: r.id || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
-                                    name: nameInput.value.trim() || null,
-                                    domain: domainVal,
-                                    enabled: Boolean(r.enabled),
-                                    selectors: r.selectors.map(s => ({
-                                        name: s.name?.trim() || '',
-                                        selector: s.selector?.trim() || '',
-                                        mode: s.mode === 'forever' ? 'forever' : 'once'
-                                    }))
-                                };
+            qS(delCard, "#wa-save-deletion-settings").addEventListener("click", () => {
+                const s = ruleManager.getSettings();
+                s.deletionSettings = s.deletionSettings || {};
+                s.deletionSettings.mutationObserverDebounceInterval =
+                    Number(qS(delCard, "#wa-mutation-debounce").value || 250);
 
-                                // Pass to next merge-handler
-                                if (typeof onSave === 'function') await onSave(newRule);
-                            }
-                        }
+                s.deletionSettings.peridoicURLCheck =
+                    !!qS(delCard, "#wa-periodic-url-check").checked;
 
-                    ]
+                s.deletionSettings.peridoicURLCheckInterval =
+                    Number(qS(delCard, "#wa-periodic-url-interval").value || 5000);
+
+                ruleManager.setSettings(s);
+                toast("Deletion settings saved", "success");
+            });
+
+            mainPane.appendChild(container);
+        }
+
+        // Render current tab
+        function renderCurrentTab() {
+            switch (currentTab) {
+                case "status": renderStatusTab(); break;
+                case "rules": renderRulesTab(); break;
+                case "stats": renderStatsTab(); break;
+                case "settings": renderSettingsTab(); break;
+                default: renderRulesTab(); break;
+            }
+        }
+
+        // Editor: openEditor(mode, rule)
+        function openEditor(mode = "add", rule = null, pickedSelector = null) {
+            if (editorOpen) {
+                // bring existing to front
+                return;
+            }
+            editorOpen = true;
+            editorMode = mode;
+
+            // Create a temporary rule object (deep copy) and a unified selectors list
+            let temp;
+            if (mode === "edit" && rule) {
+                temp = JSON.parse(JSON.stringify(rule));
+                // Build unified selectors array with a type field (temp | perm).
+                // Accept both stored temp/permanent arrays OR a prebuilt selectors array (from unsaved editor state).
+                temp.selectors = [];
+                if (Array.isArray(rule.selectors) && rule.selectors.length) {
+                    rule.selectors.forEach(s => temp.selectors.push({ type: s.type || "temp", name: s.name || "", selector: s.selector || "" }));
+                } else {
+                    (rule.tempSelectors || []).forEach(s => temp.selectors.push({ type: "temp", name: s.name || "", selector: s.selector || "" }));
+                    (rule.permanentSelectors || []).forEach(s => temp.selectors.push({ type: "perm", name: s.name || "", selector: s.selector || "" }));
+                }
+            } else {
+                temp = {
+                    ID: null,
+                    name: "",
+                    domain: location.hostname || location.href,
+                    selectors: [],
+                    ruleEnabled: true,
+                    tempDeleteCount: 0,
+                    permanentDeleteCount: 0,
+                };
+            }
+
+            // If a selector is pre-picked, append it to unified selectors (default to temp)
+            if (pickedSelector) {
+                temp.selectors = temp.selectors || [];
+                temp.selectors.push({ type: "temp", name: pickedSelector.name || "", selector: pickedSelector.selector || "" });
+            }
+
+            editorTemp = temp;
+
+            // Build modal
+            const modal = document.createElement("div");
+            modal.className = "wa-editor-modal";
+            modal.innerHTML = `
+            <div class="wa-editor-window" role="dialog" aria-modal="true">
+                <div class="wa-editor-header">
+                    <div style="font-weight:700">${mode === "add" ? "Add Rule" : "Edit Rule"}</div>
+                </div>
+                <div style="display:flex;gap:12px;flex-direction:column;">
+                    <div class="wa-form-row"><input class="wa-input" id="wa-editor-name" placeholder="Rule name" /></div>
+                    <div class="wa-form-row"><input class="wa-input" id="wa-editor-domain" placeholder="Domain (e.g. example.com)" /></div>
+
+                    <div>
+                        <div style="font-weight:700">Selectors</div>
+                        <div id="wa-editor-selectors" style="margin-top:8px;"></div>
+                        <div style="margin-top:8px;"><button class="wa-btn" id="wa-add-selector">Add selector</button></div>
+                        <div class="wa-small" style="margin-top:6px;opacity:0.8">Click the "Temp"/"Perm" button on a selector to toggle its deletion type.</div>
+                    </div>
+
+                    <div style="display:flex;gap:8px;align-items:center;">
+                        <label class="wa-toggle"><input type="checkbox" id="wa-editor-enabled" /> <span class="wa-small">Rule enabled</span></label>
+                        <label class="wa-toggle" style="margin-left:8px;"><input type="checkbox" id="wa-editor-deletionrules" /> <span class="wa-small">Include deletionRules key</span></label>
+                        <div style="margin-left:auto;" class="wa-small">ID: <span id="wa-editor-id"></span></div>
+                    </div>
+
+                    <div class="wa-footer">
+                        <button class="wa-btn" id="wa-editor-cancel">Cancel</button>
+                        <button class="wa-btn primary" id="wa-editor-save">${mode === "add" ? "Add Rule" : "Save Changes"}</button>
+                    </div>
+                </div>
+            </div>
+        `;
+            shadow.appendChild(modal);
+
+            // Fill values
+            qS(modal, "#wa-editor-name").value = temp.name || "";
+            qS(modal, "#wa-editor-domain").value = temp.domain || "";
+            qS(modal, "#wa-editor-enabled").checked = !!temp.ruleEnabled;
+            // default deletionRules toggle: use existing rule value or true for new
+            qS(modal, "#wa-editor-deletionrules").checked = (temp.deletionRules && temp.deletionRules.enabled !== undefined) ? !!temp.deletionRules.enabled : true;
+            qS(modal, "#wa-editor-id").textContent = temp.ID || "(new)";
+
+            // Render unified selector list
+            // capture original snapshot for dirty-checking
+            const originalSnapshot = {
+                name: (rule && rule.name) || "",
+                domain: (rule && rule.domain) || location.hostname,
+                ruleEnabled: (rule && rule.ruleEnabled) || true,
+                selectors: (rule ? [...(rule.tempSelectors || []).map(s => ({ type: "temp", name: s.name || "", selector: s.selector || "" })), ...(rule.permanentSelectors || []).map(s => ({ type: "perm", name: s.name || "", selector: s.selector || "" }))] : [])
+            };
+
+            function renderSelectorLists() {
+                const wrapper = qS(modal, "#wa-editor-selectors");
+                wrapper.innerHTML = "";
+                (temp.selectors || []).forEach((it, idx) => {
+                    const row = document.createElement("div"); row.className = "wa-selector-item";
+                    // Show a toggle button for type so user can switch with one click
+                    const typeLabel = it.type === "perm" ? "Perm" : "Temp";
+                    row.innerHTML = `
+                        <input class="wa-input" data-field="name" data-idx="${idx}" placeholder="Name" value="${(it.name || "").replace(/"/g, '&quot;')}" style="width:30%"/>
+                        <input class="wa-input" data-field="selector" data-idx="${idx}" placeholder="CSS selector" value="${(it.selector || "").replace(/"/g, '&quot;')}" style="width:55%"/>
+                        <button class="wa-btn" data-action="toggle-type" data-idx="${idx}">${typeLabel}</button>
+                        <button class="wa-btn" data-action="del" data-idx="${idx}">Del</button>
+                    `;
+                    wrapper.appendChild(row);
                 });
-            }
 
-            // ---------- Rules management (load/save) ----------
-            async function loadRules() {
-                try {
-                    const raw = await GM.getValue(RULES_KEY);
-                    if (!raw) return [];
-                    const parsed = (typeof raw === 'string') ? JSON.parse(raw) : raw;
-                    if (!Array.isArray(parsed)) return [];
-                    return parsed;
-                } catch (e) { return []; }
-            }
-            async function saveRules(rules) {
-                try {
-                    await GM.setValue(RULES_KEY, JSON.stringify(rules));
-                    showToast('Rules saved');
-                    // refresh engine to immediately apply
-                    try { if (window.__vm_refreshEngine) window.__vm_refreshEngine(); } catch (e) { }
-                } catch (e) {
-                    showToast('Failed to save rules', { timeout: 2000 });
-                }
-            }
-
-            async function updateSetting(key, value, { show = true, refreshEngine = false } = {}) {
-                try {
-                    CONFIG[key] = value;
-                    await GM.setValue(key, value);
-                } catch (e) {
-                }
-
-                if (key === 'theme_mode' || key === 'accent_color') {
-                    applyThemeVars({ fade: true });
-                }
-                if (key === 'mutation_debounce_interval') {
-                    refreshEngine = true;
-                }
-                if (key === 'url_periodic_check' || key === 'url_periodic_check_interval') {
-                    refreshEngine = true;
-                }
-                if (key === 'disable_script') {
-                    refreshEngine = true;
-                }
-                if (key === 'debug_mode') {
-                    debug = Boolean(CONFIG.debug_mode);
-                }
-                if (show && CONFIG.notifications_active !== false) {
-                    try { showToast(`${key} set to ${String(value)}`, { timeout: 1100 }); } catch (e) { }
-                }
-
-                if (refreshEngine) {
-                    try { if (window.__vm_refreshEngine) window.__vm_refreshEngine(); } catch (e) { }
-                }
-            }
-
-            // ---------- Main window rendering ----------
-            async function renderMainWindow() {
-                ensureStyles();
-                const root = ensureRoot();
-                const main = q(`#${ROOT_ID} #${MAIN_WIN_ID}`);
-                main.innerHTML = '';
-
-                // header
-                const header = el('div', { class: 'vm-header' });
-                header.appendChild(el('div', { class: 'vm-title' }, 'VM Deletion Engine'));
-                const tabs = el('div', { class: 'vm-tabs' });
-                const tabNames = ['Status', 'Rules', 'Settings'];
-                const tabEls = [];
-                let active = 0;
-                // content container
-                const body = el('div', { class: 'vm-body' });
-
-                function activateTab(i) {
-                    active = i;
-                    tabEls.forEach((t, idx) => {
-                        if (idx === i) t.classList.add('active'); else t.classList.remove('active');
+                // attach listeners to inputs & buttons
+                qSA(modal, 'input[data-field]').forEach(inp => {
+                    inp.addEventListener("input", (ev) => {
+                        const idx = Number(ev.target.dataset.idx);
+                        const field = ev.target.dataset.field;
+                        if (!temp.selectors || !temp.selectors[idx]) return;
+                        temp.selectors[idx][field] = ev.target.value;
                     });
-                    // render content
-                    body.innerHTML = '';
-                    if (i === 0) renderStatus(body);
-                    if (i === 1) renderRules(body);
-                    if (i === 2) renderSettings(body);
-                }
-
-                tabNames.forEach((name, i) => {
-                    const t = el('button', { class: 'vm-tab' }, name);
-                    t.addEventListener('click', () => activateTab(i));
-                    tabs.appendChild(t);
-                    tabEls.push(t);
                 });
-
-                header.appendChild(tabs);
-                main.appendChild(header);
-                main.appendChild(body);
-                // open default tab
-                activateTab(0);
-                return { main, header, body, activateTab };
-            }
-
-            // ---------- Status tab ----------
-            function renderStatus(container) {
-                const statsCard = el('div', { class: 'vm-card' });
-                const statsRow = el('div', { class: 'vm-stats' });
-
-                const counts = window.__vm_getDeletedCounts ? window.__vm_getDeletedCounts() : { once: 0, forever: 0 };
-
-                // Create stat elements with reference to .num elements for future updates
-                const onceStat = el('div', { class: 'stat once-count' },
-                    el('div', { class: 'num' }, counts.once),
-                    el('div', { class: 'label' }, 'Deleted (once)')
-                );
-                const foreverStat = el('div', { class: 'stat forever-count' },
-                    el('div', { class: 'num' }, counts.forever),
-                    el('div', { class: 'label' }, 'Deleted (forever)')
-                );
-
-                const urlInfo = el('div', { class: 'stat' },
-                    el('div', { style: { fontSize: '13px', fontWeight: '700' } }, 'Current URL'),
-                    el('div', { class: 'rule-domain' }, window.location.href)
-                );
-
-                statsRow.appendChild(onceStat);
-                statsRow.appendChild(foreverStat);
-                statsRow.appendChild(urlInfo);
-
-                statsCard.appendChild(statsRow);
-                container.appendChild(statsCard);
-
-                // Now we have references to the num elements for once and forever stats
-                const onceCountElement = onceStat.querySelector('.num');
-                const foreverCountElement = foreverStat.querySelector('.num');
-
-                // Update the UI on deletion events
-                window.addEventListener('vm-deleted-once', (event) => {
-                    if (event.detail) {
-                        onceCountElement.textContent = event.detail.count; // Update the once count
-                    }
+                qSA(modal, 'button[data-action="toggle-type"]').forEach(b => {
+                    b.addEventListener("click", (ev) => {
+                        const idx = Number(ev.target.dataset.idx);
+                        if (!temp.selectors || !temp.selectors[idx]) return;
+                        temp.selectors[idx].type = (temp.selectors[idx].type === "perm") ? "temp" : "perm";
+                        renderSelectorLists();
+                    });
                 });
-
-                window.addEventListener('vm-deleted-forever', (event) => {
-                    if (event.detail) {
-                        foreverCountElement.textContent = event.detail.count; // Update the forever count
-                    }
+                qSA(modal, 'button[data-action="del"]').forEach(b => {
+                    b.addEventListener("click", (ev) => {
+                        const idx = Number(ev.target.dataset.idx);
+                        if (!temp.selectors) return;
+                        temp.selectors.splice(idx, 1);
+                        renderSelectorLists();
+                    });
                 });
             }
+            renderSelectorLists();
 
+            // Add selector button
+            qS(modal, "#wa-add-selector").addEventListener("click", () => {
+                temp.selectors = temp.selectors || [];
+                temp.selectors.push({ type: "temp", name: "", selector: "" });
+                renderSelectorLists();
+            });
 
-            function mergeSelectors(oldRule, newRule) {
-                const merged = JSON.parse(JSON.stringify(oldRule));
-
-                const map = new Map();
-
-                // Load old selectors
-                for (const sel of merged.selectors) {
-                    const key = sel.selector.trim();
-                    if (!key) continue;
-                    map.set(key, { ...sel });
+            // Cancel button
+            qS(modal, "#wa-editor-cancel").addEventListener("click", async () => {
+                // check for dirty changes using unified selectors
+                const nowTemp = {
+                    name: qS(modal, "#wa-editor-name").value,
+                    domain: qS(modal, "#wa-editor-domain").value,
+                    ruleEnabled: qS(modal, "#wa-editor-enabled").checked,
+                    selectors: (temp.selectors || []).map(it => ({ type: it.type, name: it.name, selector: it.selector }))
+                };
+                // simple dirty detection
+                const isDirty = JSON.stringify(nowTemp) !== JSON.stringify(originalSnapshot);
+                if (isDirty) {
+                    const ok = await confirmDialog("Discard changes", "Discard unsaved changes?");
+                    if (!ok) return;
                 }
+                modal.remove();
+                editorOpen = false;
+                editorTemp = null;
+                renderCurrentTab();
+            });
 
-                // Merge / override with new selectors
-                for (const sel of newRule.selectors) {
-                    const key = sel.selector.trim();
-                    if (!key) continue;
+            // Save button
+            qS(modal, "#wa-editor-save").addEventListener("click", async () => {
+                // collect values
+                temp.name = qS(modal, "#wa-editor-name").value.trim();
+                temp.domain = qS(modal, "#wa-editor-domain").value.trim();
+                temp.ruleEnabled = !!qS(modal, "#wa-editor-enabled").checked;
+                // deletionRules toggle state stored on temp for save
+                temp.deletionRules = temp.deletionRules || {};
+                temp.deletionRules.enabled = !!qS(modal, "#wa-editor-deletionrules").checked;
 
-                    // If same CSS selector exists, override entire entry (both once/forever)
-                    map.set(key, { ...sel });
+                // ensure selectors arrays exist by splitting unified selectors
+                temp.tempSelectors = (temp.selectors || []).filter(it => it.type !== "perm").map(it => ({ name: (it.name || "").trim(), selector: (it.selector || "").trim() })).filter(it => it.selector);
+                temp.permanentSelectors = (temp.selectors || []).filter(it => it.type === "perm").map(it => ({ name: (it.name || "").trim(), selector: (it.selector || "").trim() })).filter(it => it.selector);
+
+                if ((!temp.tempSelectors || temp.tempSelectors.length === 0) && (!temp.permanentSelectors || temp.permanentSelectors.length === 0)) {
+                    toast("Please add at least one selector", "error");
+                    return;
                 }
+                if (!temp.domain) {
+                    toast("Please provide a valid domain", "error");
+                    return;
+                }
+                // call ruleManager.saveRule with correct mode
+                let payload = JSON.parse(JSON.stringify(temp));
+                if (mode === "edit" && rule && rule.ID) {
+                    payload.ID = rule.ID;
+                }
+                // ensure flag passed along for saveRule
+                payload.deletionRulesEnabled = !!temp.deletionRules.enabled;
 
-                merged.selectors = Array.from(map.values());
-                merged.enabled = newRule.enabled; // optional: sync enabled state
-
-                return merged;
-            }
-
-            // ---------- Rules tab ----------
-            async function renderRules(container) {
-                const card = el('div', { class: 'vm-card' });
-                const headerRow = el('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } });
-                headerRow.appendChild(el('div', { style: { fontWeight: 700 } }, 'Rules'));
-                const addBtn = createButton('Add Rule', {
-                    onClick: async () => {
-                        openRuleEditor({
-                            rule: null, onSave: async (newRule) => {
-                                const rules = await loadRules();
-                                const existing = rules.find(r => r.domain === newRule.domain);
-                                if (existing) {
-                                    const merged = mergeSelectors(existing, newRule);
-                                    const idx = rules.indexOf(existing);
-                                    rules[idx] = merged;
-                                    showToast('Merged with existing rule', { timeout: 1800 });
-                                } else {
-                                    rules.push(newRule);
-                                }
-                                await saveRules(rules);
-                                await refreshRulesView();
-                            }
-                        });
-                    }
-                });
-                headerRow.appendChild(addBtn);
-                card.appendChild(headerRow);
-                const listWrap = el('div', { class: 'rules-list' });
-                card.appendChild(listWrap);
-                container.appendChild(card);
-
-                async function refreshRulesView() {
-                    listWrap.innerHTML = '';
-                    const rules = await loadRules();
-                    if (rules.length === 0) {
-                        listWrap.appendChild(el('div', { class: 'rule-row' }, 'No rules defined for this site.'));
+                try {
+                    const result = ruleManager.saveRule(payload, mode === "edit" ? "edit" : "add");
+                    if (!result || !result.status) {
+                        toast("Failed to save rule", "error");
                         return;
                     }
-                    rules.forEach((r, idx) => {
-                        const row = buildRuleRow(r, idx, async (rule, i) => {
-                            openRuleEditor({
-                                rule, onSave: async (updated) => {
-                                    const all = await loadRules();
-                                    all[i] = updated;
-                                    await saveRules(all);
-                                    await refreshRulesView();
+                    if (result.status === "duplicate") {
+                        // duplicate domain - offer merge into existing rule instead of silently failing
+                        const existing = result.existingRule;
+                        toast("Duplicate domain detected.", "error");
+                        if (existing) {
+                            // Ask user if they'd like to merge their unsaved changes into the existing rule
+                            const ok = await confirmDialog("Merge rules?", `A rule already exists for domain \"${result.domain}\". Merge your changes into the existing rule? (OK = Merge, Cancel = Edit existing)`);
+                            if (ok) {
+                                try {
+                                    // mergeRules will persist and return the merged saved rule
+                                    const merged = ruleManager.mergeRules(existing, payload);
+                                    toast("Rules merged", "success");
+                                    // close editor and refresh UI + engine
+                                    modal.remove(); editorOpen = false; editorTemp = null;
+                                    renderCurrentTab();
+                                    await engine.restart?.();
+                                    return;
+                                } catch (err) {
+                                    console.error("Merge failed", err);
+                                    toast("Merge failed", "error");
+                                    return;
                                 }
-                            });
-                        }, async (rule, i) => {
-                            openPopup({
-                                title: 'Delete rule?',
-                                content: el('div', {}, `Delete "${rule.name || rule.domain || 'rule'}"? This action cannot be undone.`),
-                                actions: [
-                                    { label: 'Cancel', ghost: true, onClick: async () => { } },
-                                    {
-                                        label: 'Delete', onClick: async () => {
-                                            const all = await loadRules();
-                                            all.splice(i, 1);
-                                            await saveRules(all);
-                                            await refreshRulesView();
-                                        }
-                                    }
-                                ]
-                            });
-                        }, async (v) => {
-                            const all = await loadRules();
-                            if (all[idx]) {
-                                all[idx].enabled = v;
-                                await saveRules(all);
-                                await refreshRulesView();
+                            } else {
+                                // Open existing rule for editing so the user can manually reconcile
+                                openEditor("edit", existing);
+                                modal.remove(); editorOpen = false; editorTemp = null;
+                                return;
                             }
-                        });
-
-                        // Listen to the events and update the counts for each rule dynamically
-                        window.addEventListener('vm-deleted-once', (event) => {
-                            console.log('vm-deleted-once event triggered', event.detail);
-                            if (event.detail.ruleName === r.name) {
-                                const onceCountElement = row.querySelector('.once-count');
-                                onceCountElement.querySelector('.num').textContent = event.detail.count;
+                        }
+                        return;
+                    }
+                    if (result.status === "added" || result.status === "updated") {
+                        toast(`Rule ${result.status}`, "success");
+                        // ensure ruleEnabled is stored correctly (some flows add new rule)
+                        const savedRule = result.rule;
+                        if (savedRule && savedRule.ID) {
+                            // if ruleEnabled not set, ensure default true
+                            if (savedRule.ruleEnabled === undefined) {
+                                ruleManager.updateRuleByID(savedRule.ID, { ruleEnabled: !!payload.ruleEnabled });
                             }
-                        });
-
-                        window.addEventListener('vm-deleted-forever', (event) => {
-                            console.log('vm-deleted-forever event triggered', event.detail);
-                            if (event.detail.ruleName === r.name) {
-                                const foreverCountElement = row.querySelector('.forever-count');
-                                foreverCountElement.querySelector('.num').textContent = event.detail.count;
-                            }
-                        });
-
-                        listWrap.appendChild(row);
-                    });
+                        }
+                        // refresh UI and restart engine
+                        modal.remove();
+                        editorOpen = false;
+                        editorTemp = null;
+                        renderCurrentTab();
+                        await engine.restart?.();
+                        return;
+                    }
+                    // other statuses
+                    toast(result.message || "Unknown response from save", "error");
+                } catch (err) {
+                    console.error("Save failed", err);
+                    toast("Error saving rule", "error");
                 }
-
-                await refreshRulesView();
-            }
-
-
-            // ---------- Settings tab ----------
-            function renderSettings(container) {
-                const card = el('div', { class: 'vm-card' });
-                const grid = el('div', { class: 'settings-grid' });
-
-                // helper to create a setting item
-                function settingItem(labelText, controlEl, desc = '') {
-                    const wrap = el('div', { class: 'setting' });
-                    wrap.appendChild(el('div', { style: { fontWeight: 700 } }, labelText));
-                    wrap.appendChild(controlEl);
-                    if (desc) wrap.appendChild(el('div', { style: { fontSize: '12px', color: 'var(--vm-muted)' } }, desc));
-                    return wrap;
-                }
-
-                // toggles: debug_mode, notifications_active, url_periodic_check, disable_script
-                const toggles = ['debug_mode', 'notifications_active', 'url_periodic_check', 'disable_script'];
-                toggles.forEach(key => {
-                    const current = Boolean(CONFIG[key]);
-                    const { el: tEl, set } = createToggle(current, async (v) => {
-                        // use unified updateSetting to ensure instant effect + persistence
-                        await updateSetting(key, v, { show: true, refreshEngine: (key === 'url_periodic_check' || key === 'disable_script') });
-                    });
-                    const s = settingItem(key.replace(/_/g, ' '), tEl, '');
-                    grid.appendChild(s);
-                });
-
-                // theme_mode toggle (light/dark)
-                const themeToggleWrap = el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } });
-                const themeBtn = createButton(CONFIG.theme_mode === 'dark' ? 'Dark' : 'Light', {
-                    onClick: async () => {
-                        const next = CONFIG.theme_mode === 'dark' ? 'light' : 'dark';
-                        await updateSetting('theme_mode', next, { show: true });
-                        // update button label after apply
-                        themeBtn.textContent = next === 'dark' ? 'Dark' : 'Light';
-                    }
-                });
-                themeToggleWrap.appendChild(themeBtn);
-                grid.appendChild(settingItem('Theme Mode', themeToggleWrap, 'Switch UI theme [Light / Dark]'));
-
-                // accent color input (text color or color picker)
-                const colorWrap = el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } });
-                const colorInput = el('input', { type: 'color', value: (CONFIG.accent_color && isHex(CONFIG.accent_color)) ? CONFIG.accent_color : '#1f4ed8', style: { width: '48px', height: '34px', borderRadius: '8px', padding: '2px' } });
-                const colorText = el('input', { style: { padding: '8px', borderRadius: '8px', flex: '1' }, value: CONFIG.accent_color || '' });
-                colorWrap.appendChild(colorInput);
-                colorWrap.appendChild(colorText);
-                // sync color input and text - use updateSetting for instant application
-                colorInput.addEventListener('input', simpleDebounce(async () => {
-                    const v = colorInput.value;
-                    colorText.value = v;
-                    await updateSetting('accent_color', v, { show: true });
-                }, 60));
-                colorText.addEventListener('change', simpleDebounce(async () => {
-                    const v = colorText.value || SETTINGS_DEFAULTS.accent_color;
-                    colorInput.value = (isHex(v) ? v : SETTINGS_DEFAULTS.accent_color);
-                    await updateSetting('accent_color', v, { show: true });
-                }, 100));
-                grid.appendChild(settingItem('Accent Color', colorWrap, 'Theme main color; use pallet to pick (hex or keyword)'));
-
-                const urlDeb = el('input', { type: 'number', value: CONFIG.url_periodic_check_interval || SETTINGS_DEFAULTS.url_periodic_check_interval, style: { padding: '8px', borderRadius: '8px' } });
-                urlDeb.addEventListener('change', simpleDebounce(async () => {
-                    const v = clamp(Number(urlDeb.value) || SETTINGS_DEFAULTS.url_periodic_check_interval, 100, 60000);
-                    await updateSetting('url_periodic_check_interval', v, { show: true, refreshEngine: true });
-                }, 200));
-                grid.appendChild(settingItem('URL Periodic Check Interval (ms)', urlDeb, 'Polling interval when periodic check is enabled'));
-
-                const mutDeb = el('input', { type: 'number', value: CONFIG.mutation_debounce_interval || SETTINGS_DEFAULTS.mutation_debounce_interval, style: { padding: '8px', borderRadius: '8px' } });
-                mutDeb.addEventListener('change', simpleDebounce(async () => {
-                    const v = clamp(Number(mutDeb.value) || SETTINGS_DEFAULTS.mutation_debounce_interval, 20, 5000);
-                    await updateSetting('mutation_debounce_interval', v, { show: true, refreshEngine: true });
-                }, 200));
-                grid.appendChild(settingItem('Page Changes Scan Interval (ms)', mutDeb, 'Delay before processing modified page contents'));
-
-                const refreshWrap = el('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } });
-                const refreshBtn = createButton('Refresh Engine', {
-                    onClick: async () => {
-                        try { await window.__vm_refreshEngine(); showToast('Engine refreshed'); } catch (e) { showToast('Refresh failed'); }
-                    }
-                });
-                refreshWrap.appendChild(refreshBtn);
-                card.appendChild(grid);
-                card.appendChild(el('div', { style: { marginTop: '12px', display: 'flex', justifyContent: 'flex-end' } }, refreshBtn));
-                container.appendChild(card);
-
-                // small helper to detect hex color
-                function isHex(v) { return /^#([0-9A-F]{3}){1,2}$/i.test(v); }
-            }
-
-            // ---------- Floating button behavior ----------
-            function wireFloatingButton(mainUi) {
-                const floatBtn = q(`#${ROOT_ID} #${FLOAT_BTN_ID}`);
-                const main = q(`#${ROOT_ID} #${MAIN_WIN_ID}`);
-                let open = false;
-                function setOpen(v) { open = v; if (open) main.classList.add('open'); else main.classList.remove('open'); }
-                floatBtn.addEventListener('click', (e) => { setOpen(!open); });
-                // click outside to close
-                document.addEventListener('click', (ev) => {
-                    if (!main.contains(ev.target) && !floatBtn.contains(ev.target)) {
-                        setOpen(false);
-                    }
-                });
-            }
-
-            // ---------- Bootstrapping the UI ----------
-            async function start() {
-                ensureStyles();
-                applyThemeVars({ fade: false }); // initial apply, no fade on first render
-                const root = ensureRoot();
-                // render main window
-                const rendered = await renderMainWindow();
-                // wire floating button toggling
-                wireFloatingButton(rendered);
-                // expose a small API
-                return {
-                    showToast,
-                    openPopup,
-                    renderMainWindow: async () => {
-                        await renderMainWindow();
-                    }
-                };
-            }
-
-            // ---------- Initialization ----------
-            const apiPromise = start();
-            // Expose API after done
-            const exported = {};
-            apiPromise.then(api => {
-                Object.assign(exported, api);
             });
-            return { start, get api() { return exported; } };
-        })();
 
-        // attach to window for external use
-        window.__vm_ui = UI;
-
-        // Start (initUI was awaited by bootstrap originally, keep same contract)
-        await UI.start();
-    }
-
-
-    async function bootstrap() {
-        debugLog('🚀 Bootstrapping...');
-        await loadAndInitializeSettings();
-        // run the engine once DOM is ready
-        if (document.body) {
-            runEngine();
-        } else {
-            document.addEventListener('DOMContentLoaded', runEngine, { once: true });
+            // expose a pick-to-editor method (used by element picker)
+            return modal;
         }
-        await initUI();
-        debugLog('✅ Bootstrapped.');
+
+        // Element picker: hover highlight & multi-click selector capture
+        let pickerActive = false;
+        let pickerOverlay = null;
+        function startElementPicker() {
+            if (pickerActive) return;
+            pickerActive = true;
+            toast("Element picker active: hover and click to pick elements. Press Esc to finish.", "info", 4000);
+
+            pickerOverlay = document.createElement("div");
+            pickerOverlay.style.position = "fixed";
+            pickerOverlay.style.inset = "0";
+            pickerOverlay.style.zIndex = "2147483649";
+            // overlay must allow pointer events so we receive mousemove/click, but we'll use elementsFromPoint
+            pickerOverlay.style.pointerEvents = "auto";
+            pickerOverlay.style.cursor = "crosshair";
+            // make overlay transparent
+            pickerOverlay.style.background = "transparent";
+            document.documentElement.appendChild(pickerOverlay);
+
+            let lastEl = null;
+
+            function isInOurUI(node) {
+                try {
+                    if (!node) return false;
+                    // if node is within the host element or its shadow root, ignore
+                    if (node.closest && node.closest(`#${hostId}`)) return true;
+                    const root = node.getRootNode && node.getRootNode();
+                    if (root && root.host && root.host.id === hostId) return true;
+                } catch (e) { }
+                return false;
+            }
+
+            function highlight(el) {
+                if (!el) return;
+                try {
+                    el.__wa_old_outline = el.style.outline;
+                    el.style.outline = "3px solid rgba(59,130,246,0.85)";
+                } catch (e) { }
+                lastEl = el;
+            }
+            function unhighlight(el) {
+                if (!el) return;
+                try { el.style.outline = el.__wa_old_outline || ""; delete el.__wa_old_outline; } catch (e) { }
+                lastEl = null;
+            }
+
+            function findTopCandidate(x, y) {
+                // elementsFromPoint returns top-down stack; pick first element that is not our overlay and not inside our UI
+                const els = document.elementsFromPoint(x, y);
+                if (!els || !els.length) return null;
+                for (const e of els) {
+                    if (!e) continue;
+                    if (e === pickerOverlay) continue;
+                    if (e === document.documentElement || e === document.body) continue;
+                    if (isInOurUI(e)) continue;
+                    return e;
+                }
+                return null;
+            }
+
+            function onMouseMove(ev) {
+                const el = findTopCandidate(ev.clientX, ev.clientY);
+                if (!el) {
+                    if (lastEl) { unhighlight(lastEl); }
+                    return;
+                }
+                if (lastEl && el !== lastEl) { unhighlight(lastEl); }
+                if (el !== lastEl) highlight(el);
+            }
+
+            async function handlePickForElement(el, selector) {
+                const pageDomain = location.hostname || location.href;   // raw host
+
+                /* ------------------------------------------------------------------ */
+                /* 1️⃣  Check if an existing rule matches the current domain.        */
+                /* ------------------------------------------------------------------ */
+                let matchedRule = null;
+                try {
+                    matchedRule = ruleManager.getAllRules().find(r => domainMatches(r.domain, pageDomain));
+                } catch (e) { console.warn('domainMatches error', e); }
+
+                /* ------------------------------------------------------------------ */
+                /* 2️⃣  If we have a match – open the editor in edit mode.             */
+                /* ------------------------------------------------------------------ */
+                if (matchedRule) {
+                    // Build a temporary copy of the rule that will be fed to the editor.
+                    const ruleCopy = JSON.parse(JSON.stringify(matchedRule));
+
+                    // Merge the newly picked selector into the temp selectors array
+                    ruleCopy.tempSelectors = [...(ruleCopy.tempSelectors || []), { type: 'temp', name: '', selector }];
+
+                    // Open the editor in *edit* mode (first argument is "edit").
+                    openEditor('edit', ruleCopy, null);
+
+                    toast('Selector added to existing rule editor', 'success', 2000);
+                    stopPicker();                     // we’re done – let the user finish editing
+                    return;
+                }
+
+                /* ------------------------------------------------------------------ */
+                /* 3️⃣  No matching rule – start a brand‑new rule (add mode).         */
+                /* ------------------------------------------------------------------ */
+                const newRulePayload = {
+                    selector,          // first selector of the new rule
+                    name: '',          // no custom name yet
+                };
+                openEditor('add', null, newRulePayload);
+
+                // pre‑fill the domain field – this is a one‑off after the modal is rendered.
+                const modalEl = qS(shadow, '.wa-editor-modal');
+                if (modalEl) {
+                    try { qS(modalEl, '#wa-editor-domain').value = pageDomain; } catch (_) { }
+                }
+
+                toast('Selector added to new editor', 'success', 2000);
+                stopPicker();                     // close the picker – user will finish editing
+            }
+
+            function onClick(ev) {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const el = findTopCandidate(ev.clientX, ev.clientY);
+                if (!el) return; // ignore clicks that don't hit a candidate
+
+                // generate selector (use existing generateCssSelector if available)
+                let selector = "";
+                try {
+                    if (typeof generateCssSelector === "function") selector = generateCssSelector(el) || "";
+                } catch (e) { /* ignore */ }
+                if (!selector) {
+                    // fallback: try id or classes
+                    try {
+                        if (el.id) selector = `#${cssEscape(el.id)}`;
+                        else if (el.classList && el.classList.length) {
+                            selector = el.tagName.toLowerCase() + "." + Array.from(el.classList).map(c => cssEscape(c)).join(".");
+                        } else {
+                            selector = el.tagName.toLowerCase();
+                        }
+                    } catch (e) { selector = ''; }
+                }
+
+                if (!selector) {
+                    toast('Unable to compute selector for element', 'error');
+                    return;
+                }
+
+                // Do NOT stop picker — allow multiple picks. Append selector to editor/modal.
+                handlePickForElement(el, selector).catch(() => {/* swallow */ });
+            }
+
+            function onKey(ev) {
+                if (ev.key === 'Escape') stopPicker();
+            }
+
+            function stopPicker() {
+                pickerActive = false;
+                try {
+                    if (lastEl) unhighlight(lastEl);
+                    pickerOverlay.removeEventListener('mousemove', onMouseMove);
+                    pickerOverlay.removeEventListener('click', onClick, { capture: true });
+                    window.removeEventListener('keydown', onKey);
+                    document.documentElement.removeChild(pickerOverlay);
+                } catch (e) { }
+                pickerOverlay = null;
+            }
+
+            pickerOverlay.addEventListener('mousemove', onMouseMove);
+            // attach click with capture so clicks on elements don't get swallowed by page handlers
+            pickerOverlay.addEventListener('click', onClick, { capture: true });
+            window.addEventListener('keydown', onKey);
+        }
+
+        // Hook deletion events from engine to update perLoadCounts and UI
+        // Reworked: only attach stats listeners when statsEnabled === true,
+        // and reconfigure when settings change.
+        let statsEngineUnsubscribe = null;
+        let statsWindowHandler = null;
+
+        function configureStatsListeners() {
+            // detach previous
+            try {
+                if (typeof statsEngineUnsubscribe === "function") {
+                    statsEngineUnsubscribe();
+                    statsEngineUnsubscribe = null;
+                }
+            } catch (e) { statsEngineUnsubscribe = null; }
+            try {
+                if (statsWindowHandler) {
+                    window.removeEventListener("web-assassin:elements-deleted", statsWindowHandler);
+                    statsWindowHandler = null;
+                }
+            } catch (e) { statsWindowHandler = null; }
+
+            // Clear per-load counters when stats disabled
+            const s = getSettings();
+            if (!s?.statsEnabled) {
+                perLoadCounts.clear();
+                // refresh UI if visible
+                if (panelVisible && (currentTab === "status" || currentTab === "stats")) {
+                    renderCurrentTab();
+                }
+                return;
+            }
+
+            // statsEnabled === true: prefer engine.onDeleted if available (programmatic),
+            // otherwise listen to window event.
+            try {
+                if (engine && typeof engine.onDeleted === "function") {
+                    statsEngineUnsubscribe = engine.onDeleted((detail) => {
+                        try {
+                            const id = detail.ruleID;
+                            const count = Number(detail.count || 1);
+                            perLoadCounts.set(id, (perLoadCounts.get(id) || 0) + count);
+                            if (panelVisible && currentTab === "status") renderStatusTab();
+                            if (panelVisible && currentTab === "stats") renderStatsTab();
+                        } catch (e) { /* swallow */ }
+                    });
+                    return;
+                }
+            } catch (e) { /* ignore and fallback */ }
+
+            // fallback: window event
+            statsWindowHandler = (e) => {
+                try {
+                    const detail = e.detail || {};
+                    const id = detail.ruleID;
+                    const count = Number(detail.count || 1);
+                    perLoadCounts.set(id, (perLoadCounts.get(id) || 0) + count);
+                    if (panelVisible && currentTab === "status") renderStatusTab();
+                    if (panelVisible && currentTab === "stats") renderStatsTab();
+                } catch (err) { /* swallow */ }
+            };
+            window.addEventListener("web-assassin:elements-deleted", statsWindowHandler);
+        }
+
+        // configure initially
+        configureStatsListeners();
+
+        // When settings change externally, re-render AND reconfigure stats listeners
+        window.addEventListener("web-assassin:settings-changed", () => {
+            style.textContent = buildStyles();
+            renderCurrentTab();
+            configureStatsListeners();
+        });
+
+        // Initial render and attach to shadow
+        renderCurrentTab();
+
+        // Do not auto-show panel on init. The UI is created lazily and the user opens it explicitly.
+        // The panel will be shown when the user clicks the floating icon (handled by the lazy bootstrap below).
+
+        // expose helper for tests/debug
+        return {
+            showPanel,
+            hidePanel,
+            togglePanel,
+            openEditor,
+        };
     }
+    // ----------------------
+    // CONTENT SCRIPT BOOTSTRAP — ALWAYS START ENGINE BEFORE UI
+    // ----------------------
+    (async () => {
+        // Load settings
+        let saved = await gmGet(GM_KEY, null);
+        if (!saved) {
+            saved = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+            await gmSet(GM_KEY, saved);
+        }
 
-    // auto-start
-    bootstrap().catch(console.error);
+        // Create rule manager (SHARED with UI)
+        const ruleManager = RuleManager(saved);
+        window.webAssassinRuleManager = ruleManager;
 
+        // Create engine and attach to window
+        const deletionEngine = DeletionEngine(ruleManager);
+        window.webAssassinEngine = deletionEngine;
+
+        if (!saved.scriptDisabled) {
+            deletionEngine.start();
+        }
+
+        window.addEventListener("web-assassin:refresh-engine", () => {
+            deletionEngine.restart?.();
+        });
+    })();
+
+
+    // expose initUI to window and initialize immediately
+    window.webAssassinInitUI = initUI;
+    // Lazy UI bootstrap: create a lightweight global FAB that initializes the full shadow-root UI on first click.
+    (function createLiteFab() {
+        if (document.getElementById("web-assassin-fab-lite")) return;
+        const lite = document.createElement("div");
+        lite.id = "web-assassin-fab-lite";
+        lite.className = "web-assassin-fab-lite";
+        lite.title = "Web Assassin";
+        lite.textContent = "WA";
+        // inline styles so the lite FAB looks usable before the shadow UI exists
+        lite.style.cssText = 'position:fixed; width:56px; height:56px; bottom:18px; right:18px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 6px 18px rgba(0,0,0,0.25); background:#0078d4; color:white; font-weight:700; z-index:2147483647; pointer-events:auto;';
+        document.documentElement.appendChild(lite);
+
+        async function onClickOnce(ev) {
+            try {
+                // initialize full UI (which creates its own shadow-root FAB/panel)
+                const ui = await initUI();
+                window.webAssassinUI = ui;
+                // remove lite FAB
+                try { lite.remove(); } catch (e) { }
+                // show the panel because user clicked the icon
+                try { ui.showPanel && ui.showPanel(); } catch (e) { }
+                console.info("Web Assassin UI initialized (lazy).");
+            } catch (err) {
+                console.error("Failed to initialize Web Assassin UI (lazy)", err);
+            } finally {
+                lite.removeEventListener("click", onClickOnce);
+            }
+        }
+
+        lite.addEventListener("click", onClickOnce);
+    })();
+    // End of IIFE
 })();

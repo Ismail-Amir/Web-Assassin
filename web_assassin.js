@@ -1,6 +1,7 @@
 // ==UserScript==
-// @name        7
+// @name        Web Assassin
 // @namespace   Violentmonkey Scripts
+// @author      Ismail Amir
 // @match       *://*/*
 // @include     file:///*
 // @grant       none
@@ -807,175 +808,147 @@
     function DeletionEngine(ruleManager) {
         if (!ruleManager) throw new Error("DeletionEngine requires a ruleManager instance");
 
-        // internal state
+        // -------------------------------------------------------------
+        // Internal State
+        // -------------------------------------------------------------
         let running = false;
-        let tempObserver = null;
         let permObserver = null;
         let urlObserversInstalled = false;
         let periodicUrlTimer = null;
         let lastUrl = location.href;
+
         let tempStopTimer = null;
         let tempStabilizeDebounce = null;
         let permDebounceTimer = null;
 
-        // aggregated maps: selector -> Set(ruleId)
+        // selector → Set(ruleIDs)
         let tempSelectorMap = new Map();
         let permSelectorMap = new Map();
 
-        // settings shortcut (read live from ruleManager)
-        function getCfg() {
-            const s = ruleManager.getSettings();
-            return (s && s.deletionSettings) ? s.deletionSettings : {};
-        }
-
-        // helpers
         const doc = document;
-        function now() { return Date.now(); }
 
-        function normalizeSel(sel) {
-            return normalizeSelectorString(sel || "");
+        // -------------------------------------------------------------
+        // Helpers (fast-path)
+        // -------------------------------------------------------------
+        const now = () => Date.now();
+        const normSel = (sel) => normalizeSelectorString(sel || "");
+
+        function addToSelectorMap(map, selector, ruleID) {
+            if (!selector) return;
+            let set = map.get(selector);
+            if (!set) map.set(selector, (set = new Set()));
+            set.add(ruleID);
         }
 
-        function addToMap(map, selector, ruleId) {
-            const k = normalizeSel(selector);
-            if (!k) return;
-            let set = map.get(k);
-            if (!set) {
-                set = new Set();
-                map.set(k, set);
-            }
-            set.add(ruleId);
+        function getDeletionConfig() {
+            const s = ruleManager.getSettings();
+            return s?.deletionSettings || {};
         }
 
-        // Build aggregated selector maps from matched rules
+        // -------------------------------------------------------------
+        // Aggregation of Selectors
+        // -------------------------------------------------------------
         function aggregateSelectorsForCurrentPage() {
             tempSelectorMap.clear();
             permSelectorMap.clear();
 
             const settings = ruleManager.getSettings();
-            const rules = settings.deletionSettings?.deletionRules || [];
-            const pageDomain = location.href;
+            const rules = settings?.deletionSettings?.deletionRules || [];
+            const pageURL = location.href;
 
             for (const r of rules) {
-                if (!r || !r.domain) continue;
+                if (!r || !r.domain || r.ruleEnabled === false) continue;
+                if (!domainMatches(r.domain, pageURL)) continue;
 
-                // NEW: skip rules that are explicitly disabled
-                if (r.ruleEnabled === false) continue;
-
-                if (!domainMatches(r.domain, pageDomain)) continue;
-
-                // temp selectors
-                (r.tempSelectors || []).forEach(it => {
-                    const sel = normalizeSel(it.selector || "");
-                    if (!sel) return;
-                    addToMap(tempSelectorMap, sel, r.ID);
-                });
-
-                // perm selectors
-                (r.permanentSelectors || []).forEach(it => {
-                    const sel = normalizeSel(it.selector || "");
-                    if (!sel) return;
-                    addToMap(permSelectorMap, sel, r.ID);
-                });
-            }
-
-            return {
-                tempSelectors: Array.from(tempSelectorMap.keys()),
-                permSelectors: Array.from(permSelectorMap.keys()),
-            };
-        }
-
-        // Convenience: turn a selector map into array of { selector, ruleIds: [...ids] }
-        function selectorMapToArray(map) {
-            return Array.from(map.entries()).map(([selector, set]) => ({ selector, ruleIds: Array.from(set) }));
-        }
-
-        // Emit deletion event and increment counters via ruleManager.
-        // countsByRule: Map(ruleId -> count)
-        function handleDeletionCounts(countsByRule, type) {
-            const s = ruleManager.getSettings();
-            const statsEnabled = !!s?.statsEnabled;
-
-            if (!statsEnabled) return;
-            for (const [ruleId, count] of countsByRule.entries()) {
-                // Only update persistent counters if statsEnabled is true in settings
-                ruleManager.incrementCounter(ruleId, type === "permanent" ? "permanent" : "temp", count);
-
-                window.dispatchEvent(new CustomEvent("web-assassin:elements-deleted", {
-                    detail: {
-                        ruleID: ruleId,
-                        deletionType: type === "permanent" ? "permanent" : "temp",
-                        count
+                if (Array.isArray(r.tempSelectors)) {
+                    for (const it of r.tempSelectors) {
+                        const sel = normSel(it?.selector);
+                        if (sel) addToSelectorMap(tempSelectorMap, sel, r.ID);
                     }
-                }));
-            }
-        }
-
-        // remove elements array (Set) and compute per-rule counts
-        function removeElementsAndCount(elements, selectorOrigins, deletionType) {
-            // selectorOrigins: Map selector -> Set(ruleIds)
-            // elements: Set of elements to remove (no duplicates)
-            const countsByRule = new Map();
-
-            for (const el of elements) {
-                try {
-                    // for safety: if already removed skip
-                    if (!el.isConnected) {
-                        // even if not connected, we might still count? skip.
+                }
+                if (Array.isArray(r.permanentSelectors)) {
+                    for (const it of r.permanentSelectors) {
+                        const sel = normSel(it?.selector);
+                        if (sel) addToSelectorMap(permSelectorMap, sel, r.ID);
                     }
-
-                    // determine which selectors matched this element by testing selectors (best-effort)
-                    // Instead of re-evaluating all selectors (heavy), we assume elements were discovered
-                    // using a specific selector; therefore, selectorOrigins has the selector(s) used previously.
-                    // We'll increment all ruleIds associated with any selector that matched this element.
-                    // To be conservative, we will test each selector in selectorOrigins map (could be many),
-                    // but we optimize by only testing those selectors we used to find the elements that led here.
-                    // Because callers will pass elements grouped by selector, we will instead accept a mapping
-                    // from selector->elements when possible. Simpler approach below:
-                    el.remove();
-                } catch (e) {
-                    try { el.parentNode && el.parentNode.removeChild(el); } catch (er) { }
                 }
             }
 
-            // Counting strategy: We rely on caller to send per-selector match counts (see below).
-            // This function only handles removal and does not attempt to rematch; return empty map.
-            return countsByRule;
+            return {
+                tempSelectors: [...tempSelectorMap.keys()],
+                permSelectors: [...permSelectorMap.keys()],
+            };
         }
 
-        // ---------------------------------------------------------
-        // TEMPORARY DELETION PASS
-        // - runs for up to temporaryDeletionMax ms
-        // - stops early when DOM stabilizes (no mutations for debounce ms)
-        // - uses a MutationObserver to detect activity and triggers debounced scan
-        // ---------------------------------------------------------
-        function runTemporaryDeletion(tempSelectorsArr) {
-            const settings = ruleManager.getSettings().deletionSettings || {};
-            const maxMs = Math.max(0, Number(settings.temporaryDeletionMax || 3000));
-            const minMs = Math.max(0, Number(settings.temporaryDeletionMin || 500));
-            const debounceStabilizeMs = Math.max(150, Math.floor((minMs + maxMs) / 6));
-            const mutationDebounce = Math.max(50, Number(settings.mutationObserverDebounceInterval || 250));
+        // -------------------------------------------------------------
+        // Stats & Event Dispatch
+        // -------------------------------------------------------------
+        function handleDeletionCounts(countMap, type) {
+            const s = ruleManager.getSettings();
+            if (!s?.statsEnabled) return;
 
-            if (!tempSelectorsArr || !tempSelectorsArr.length) return Promise.resolve({ totalDeleted: 0, perRuleCounts: new Map() });
+            for (const [ruleId, count] of countMap.entries()) {
+                ruleManager.incrementCounter(
+                    ruleId,
+                    type === "permanent" ? "permanent" : "temp",
+                    count
+                );
+
+                window.dispatchEvent(
+                    new CustomEvent("web-assassin:elements-deleted", {
+                        detail: { ruleID: ruleId, deletionType: type, count }
+                    })
+                );
+            }
+        }
+
+        // -------------------------------------------------------------
+        // TEMPORARY PASS
+        // -------------------------------------------------------------
+        function runTemporaryDeletion(selectors) {
+            if (!selectors || selectors.length === 0)
+                return Promise.resolve({ totalDeleted: 0, perRuleCounts: new Map() });
+
+            const cfg = getDeletionConfig();
+            const maxMs = Math.max(0, Number(cfg.temporaryDeletionMax || 3000));
+            const minMs = Math.max(0, Number(cfg.temporaryDeletionMin || 500));
+            const mutationDebounce = Math.max(
+                50,
+                Number(cfg.mutationObserverDebounceInterval || 250)
+            );
+            const stabilizeMs = Math.max(150, Math.floor((minMs + maxMs) / 6));
+
             const selectorToRules = new Map();
-            for (const [sel, set] of tempSelectorMap.entries()) selectorToRules.set(sel, new Set(set));
-            const removedSet = new Set();
+            for (const [sel, set] of tempSelectorMap.entries()) {
+                selectorToRules.set(sel, new Set(set));
+            }
+
+            const removed = new Set();
             const perRuleCounts = new Map();
 
-            function scanAll() {
-                for (const sel of tempSelectorsArr) {
-                    let elems = [];
-                    try { elems = Array.from(doc.querySelectorAll(sel)); } catch (e) { continue; }
-                    for (const el of elems) {
-                        if (!el || !(el instanceof Element)) continue;
-                        if (removedSet.has(el)) continue;
+            function scan() {
+                for (const sel of selectors) {
+                    let nodeList;
+                    try {
+                        nodeList = doc.querySelectorAll(sel);
+                    } catch {
+                        continue; // invalid selector
+                    }
 
-                        try { el.remove(); } catch (e) { try { el.parentNode && el.parentNode.removeChild(el); } catch (e) { } }
-                        removedSet.add(el);
+                    for (const el of nodeList) {
+                        if (!el || !el.isConnected || removed.has(el)) continue;
+                        try {
+                            el.remove();
+                        } catch {
+                            try { el.parentNode?.removeChild(el); } catch { }
+                        }
+                        removed.add(el);
 
-                        const ruleIds = selectorToRules.get(sel) || new Set();
-                        for (const id of ruleIds) {
-                            perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                        const ruleIds = selectorToRules.get(sel);
+                        if (ruleIds) {
+                            for (const id of ruleIds) {
+                                perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                            }
                         }
                     }
                 }
@@ -983,146 +956,166 @@
 
             return new Promise((resolve) => {
                 let done = false;
+                scan();
 
-                scanAll();
-
-                const mo = new MutationObserver((mutations) => {
-                    if (tempStabilizeDebounce) clearTimeout(tempStabilizeDebounce);
-                    tempStabilizeDebounce = setTimeout(() => {
-                        scanAll();
-                    }, mutationDebounce);
+                const mo = new MutationObserver(() => {
+                    clearTimeout(tempStabilizeDebounce);
+                    tempStabilizeDebounce = setTimeout(scan, mutationDebounce);
                 });
+
                 try {
-                    mo.observe(doc.documentElement || doc.body, { childList: true, subtree: true, attributes: false, characterData: false });
-                } catch (e) {
-                    try { mo.observe(doc.body || doc.documentElement, { childList: true, subtree: true }); } catch (er) { }
+                    mo.observe(doc.documentElement, { childList: true, subtree: true });
+                } catch {
+                    try {
+                        mo.observe(doc.body, { childList: true, subtree: true });
+                    } catch { }
                 }
 
-                function scheduleStopEarly() {
-                    if (tempStabilizeDebounce) clearTimeout(tempStabilizeDebounce);
-                    tempStabilizeDebounce = setTimeout(() => {
-                        if (done) return;
-                        done = true;
-                        try { mo.disconnect(); } catch (e) { }
-                        if (tempStopTimer) { clearTimeout(tempStopTimer); tempStopTimer = null; }
-                        handleDeletionCounts(perRuleCounts, "temp");
-                        resolve({ totalDeleted: removedSet.size, perRuleCounts });
-                    }, debounceStabilizeMs);
-                }
-
-                scheduleStopEarly();
-                tempStopTimer = setTimeout(() => {
+                function finish() {
                     if (done) return;
                     done = true;
-                    try { mo.disconnect(); } catch (e) { }
-                    if (tempStabilizeDebounce) { clearTimeout(tempStabilizeDebounce); tempStabilizeDebounce = null; }
+                    try { mo.disconnect(); } catch { }
+                    clearTimeout(tempStabilizeDebounce);
+                    clearTimeout(tempStopTimer);
                     handleDeletionCounts(perRuleCounts, "temp");
-                    resolve({ totalDeleted: removedSet.size, perRuleCounts });
-                }, maxMs);
+                    resolve({ totalDeleted: removed.size, perRuleCounts });
+                }
+
+                tempStabilizeDebounce = setTimeout(finish, stabilizeMs);
+                tempStopTimer = setTimeout(finish, maxMs);
             });
         }
 
+        // -------------------------------------------------------------
+        // PERMANENT PASS
+        // -------------------------------------------------------------
+        function startPermanentObserver(selectors) {
+            const cfg = getDeletionConfig();
+            const debounceMs = Math.max(
+                50,
+                Number(cfg.peridoicURLMutationDebounce || cfg.mutationObserverDebounceInterval || 250)
+            );
 
-        // ---------------------------------------------------------
-        // PERMANENT DELETION OBSERVER
-        // - watches added nodes only
-        // - debounced processing to batch added nodes
-        // ---------------------------------------------------------
-        function startPermanentObserver(permSelectorsArr) {
-            const settings = ruleManager.getSettings().deletionSettings || {};
-            const debounceMs = Math.max(50, Number(settings.peridoicURLMutationDebounce || settings.mutationObserverDebounceInterval || 250));
-            let nodesQueue = new Set();
+            const selectorToRules = new Map();
+            for (const [sel, set] of permSelectorMap.entries()) {
+                selectorToRules.set(sel, new Set(set));
+            }
 
-            function processQueue() {
-                if (!nodesQueue.size) return;
-                const nodes = Array.from(nodesQueue);
-                nodesQueue.clear();
-                const selectorToRules = new Map();
-                for (const [sel, set] of permSelectorMap.entries()) selectorToRules.set(sel, new Set(set));
+            let queue = new Set();
+
+            function process() {
+                if (!queue.size) return;
+
+                const nodes = [...queue];
+                queue.clear();
 
                 const removed = new Set();
-                const perRuleCounts = new Map();
+                const ruleCounts = new Map();
 
                 for (const node of nodes) {
                     if (!node) continue;
 
-                    const rootCandidates = (node.nodeType === 1) ? [node] : [];
+                    const roots = node.nodeType === 1 ? [node] : [];
 
-                    for (const sel of permSelectorsArr) {
-                        try {
-                            for (const rootNode of rootCandidates) {
-                                try {
-                                    if (rootNode.matches && rootNode.matches(sel)) {
-                                        if (!removed.has(rootNode)) {
-                                            try { rootNode.remove(); } catch (e) { try { rootNode.parentNode && rootNode.parentNode.removeChild(rootNode); } catch (er) { } }
-                                            removed.add(rootNode);
-                                            const ruleIds = selectorToRules.get(sel) || new Set();
-                                            for (const id of ruleIds) perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
+                    for (const sel of selectors) {
+                        let ruleIds = selectorToRules.get(sel);
+                        if (!ruleIds) continue;
+
+                        // Check root
+                        for (const root of roots) {
+                            try {
+                                if (root.matches?.(sel)) {
+                                    if (!removed.has(root)) {
+                                        try { root.remove(); } catch {
+                                            try { root.parentNode?.removeChild(root); } catch { }
                                         }
+                                        removed.add(root);
+                                        for (const id of ruleIds)
+                                            ruleCounts.set(id, (ruleCounts.get(id) || 0) + 1);
                                     }
-                                } catch (e) { /* invalid selector on rootNode.matches - skip */ }
+                                }
+                            } catch { }
+                        }
+
+                        // Query children
+                        let matches;
+                        try {
+                            matches = node.querySelectorAll?.(sel);
+                        } catch {
+                            continue;
+                        }
+
+                        if (!matches) continue;
+
+                        for (const m of matches) {
+                            if (!m || !m.isConnected || removed.has(m)) continue;
+                            try { m.remove(); } catch {
+                                try { m.parentNode?.removeChild(m); } catch { }
                             }
-                            let matches = [];
-                            try { matches = Array.from(node.querySelectorAll ? node.querySelectorAll(sel) : []); } catch (e) { continue; }
-                            for (const m of matches) {
-                                if (!m || !(m instanceof Element)) continue;
-                                if (removed.has(m)) continue;
-                                try { m.remove(); } catch (e) { try { m.parentNode && m.parentNode.removeChild(m); } catch (er) { } }
-                                removed.add(m);
-                                const ruleIds = selectorToRules.get(sel) || new Set();
-                                for (const id of ruleIds) perRuleCounts.set(id, (perRuleCounts.get(id) || 0) + 1);
-                            }
-                        } catch (e) { /* swallow */ }
+                            removed.add(m);
+                            for (const id of ruleIds)
+                                ruleCounts.set(id, (ruleCounts.get(id) || 0) + 1);
+                        }
                     }
                 }
-                handleDeletionCounts(perRuleCounts, "permanent");
+
+                handleDeletionCounts(ruleCounts, "permanent");
             }
 
-            function scheduleProcess() {
-                if (permDebounceTimer) clearTimeout(permDebounceTimer);
-                permDebounceTimer = setTimeout(() => {
-                    processQueue();
-                }, debounceMs);
+            function schedule() {
+                clearTimeout(permDebounceTimer);
+                permDebounceTimer = setTimeout(process, debounceMs);
             }
 
             permObserver = new MutationObserver((mutations) => {
                 for (const m of mutations) {
-                    for (const n of m.addedNodes) {
-                        nodesQueue.add(n);
-                    }
+                    for (const n of m.addedNodes) queue.add(n);
                 }
-                scheduleProcess();
+                schedule();
             });
 
             try {
-                permObserver.observe(doc.documentElement || doc.body, { childList: true, subtree: true });
-            } catch (e) {
-                try { permObserver.observe(doc.body || doc.documentElement, { childList: true, subtree: true }); } catch (er) { }
+                permObserver.observe(doc.documentElement, { childList: true, subtree: true });
+            } catch {
+                try { permObserver.observe(doc.body, { childList: true, subtree: true }); } catch { }
             }
 
             return () => {
-                try { permObserver && permObserver.disconnect(); } catch (e) { }
+                try { permObserver.disconnect(); } catch { }
+                clearTimeout(permDebounceTimer);
                 permObserver = null;
-                if (permDebounceTimer) { clearTimeout(permDebounceTimer); permDebounceTimer = null; }
             };
         }
 
+        // -------------------------------------------------------------
+        // URL Change Handling
+        // -------------------------------------------------------------
+        let urlChangeDebounce = null;
 
-        // ---------------------------------------------------------
-        // URL change detection (history API + popstate + hashchange + optional periodic)
-        // ---------------------------------------------------------
+        function scheduleUrlChange() {
+            clearTimeout(urlChangeDebounce);
+            urlChangeDebounce = setTimeout(() => {
+                const newUrl = location.href;
+                if (newUrl !== lastUrl) {
+                    lastUrl = newUrl;
+                    restart();
+                }
+            }, 120);
+        }
+
         function installUrlObservers() {
             if (urlObserversInstalled) return;
             urlObserversInstalled = true;
 
-            // patch history.pushState / replaceState
             const origPush = history.pushState;
             const origReplace = history.replaceState;
+
             history.pushState = function (...args) {
                 const result = origPush.apply(this, args);
                 scheduleUrlChange();
                 return result;
             };
+
             history.replaceState = function (...args) {
                 const result = origReplace.apply(this, args);
                 scheduleUrlChange();
@@ -1132,167 +1125,87 @@
             window.addEventListener("popstate", scheduleUrlChange);
             window.addEventListener("hashchange", scheduleUrlChange);
 
-            const settings = ruleManager.getSettings();
-            if (settings.deletionSettings?.peridoicURLCheck) {
+            const cfg = getDeletionConfig();
+            if (cfg.peridoicURLCheck) {
                 periodicUrlTimer = setInterval(() => {
                     if (location.href !== lastUrl) scheduleUrlChange();
-                }, Math.max(500, Number(settings.deletionSettings.peridoicURLCheckInterval || 5000)));
+                }, Math.max(500, Number(cfg.peridoicURLCheckInterval || 5000)));
             }
         }
 
         function uninstallUrlObservers() {
             if (!urlObserversInstalled) return;
             urlObserversInstalled = false;
-            try {
-                // cannot easily restore original push/replace references in all runtime cases; keep patched functions
-            } catch (e) { }
-            try { window.removeEventListener("popstate", scheduleUrlChange); } catch (e) { }
-            try { window.removeEventListener("hashchange", scheduleUrlChange); } catch (e) { }
-            if (periodicUrlTimer) { clearInterval(periodicUrlTimer); periodicUrlTimer = null; }
+
+            window.removeEventListener("popstate", scheduleUrlChange);
+            window.removeEventListener("hashchange", scheduleUrlChange);
+
+            if (periodicUrlTimer) {
+                clearInterval(periodicUrlTimer);
+                periodicUrlTimer = null;
+            }
         }
 
-        let urlChangeDebounce = null;
-        function scheduleUrlChange() {
-            // debounce a little to avoid flapping
-            if (urlChangeDebounce) clearTimeout(urlChangeDebounce);
-            urlChangeDebounce = setTimeout(() => {
-                urlChangeDebounce = null;
-                const newUrl = location.href;
-                if (newUrl === lastUrl) return;
-                lastUrl = newUrl;
-                // restart engine on URL change
-                restart();
-            }, 120);
-        }
-
-        // ---------------------------------------------------------
-        // main bootstrap logic
-        // ---------------------------------------------------------
+        // -------------------------------------------------------------
+        // Engine Core
+        // -------------------------------------------------------------
         async function start() {
             if (running) return;
             running = true;
             lastUrl = location.href;
 
-            const settings = ruleManager.getSettings();
-            if (settings.deletionSettings?.scriptDisabled) {
-                // don't run if disabled
-                return;
-            }
+            const cfg = getDeletionConfig();
+            if (cfg.scriptDisabled) return;
 
-            // Stage 1: check if any rule matches current page
-            const allRules = ruleManager.getAllRules() || [];
-            const pageDomain = location.href;
-            // Only consider enabled rules when deciding whether we have any matches.
-            const matchesAny = allRules.some(r => (r.ruleEnabled !== false) && domainMatches(r.domain, pageDomain));
+            const rules = ruleManager.getAllRules() || [];
+            const pageURL = location.href;
+
+            const matchesAny =
+                rules.some(r => r?.ruleEnabled !== false && domainMatches(r.domain, pageURL));
+
             if (!matchesAny) {
-                // still install URL observers so engine can start on SPA navigation
                 installUrlObservers();
                 return;
             }
 
-            // Stage 2: aggregate selectors from matching rules
             const { tempSelectors, permSelectors } = aggregateSelectorsForCurrentPage();
 
-            // Stage 3: early exit if nothing to delete
-            if ((!tempSelectors || tempSelectors.length === 0) && (!permSelectors || permSelectors.length === 0)) {
+            if ((!tempSelectors.length) && (!permSelectors.length)) {
                 installUrlObservers();
                 return;
             }
 
-            // Run temp deletion (short-lived)
             try {
                 await runTemporaryDeletion(tempSelectors);
-            } catch (e) {
-                // ignore
-            }
+            } catch { }
 
-            // Setup permanent observer (long-lived)
             const stopPerm = startPermanentObserver(permSelectors);
 
-            // install URL observers (so we can restart on URL change)
             installUrlObservers();
 
-            // store stop function on module state for later
-            // when stopping engine, call stopPerm()
-            permStopFn = stopPerm;
+            // Handed to restart()
+            cleanupPermanent = stopPerm;
         }
 
-        let permStopFn = null;
+        let cleanupPermanent = null;
 
-        // stop/cleanup everything
         function stop() {
-            if (!running) return;
             running = false;
-            try {
-                if (tempObserver) { tempObserver.disconnect(); tempObserver = null; }
-            } catch (e) { }
-            try {
-                if (permObserver) { permObserver.disconnect(); permObserver = null; }
-            } catch (e) { }
-            if (permStopFn) {
-                try { permStopFn(); } catch (e) { }
-                permStopFn = null;
-            }
-            try {
-                uninstallUrlObservers();
-            } catch (e) { }
-            if (tempStopTimer) { clearTimeout(tempStopTimer); tempStopTimer = null; }
-            if (tempStabilizeDebounce) { clearTimeout(tempStabilizeDebounce); tempStabilizeDebounce = null; }
-            if (permDebounceTimer) { clearTimeout(permDebounceTimer); permDebounceTimer = null; }
+            cleanupPermanent?.();
+            cleanupPermanent = null;
+            clearTimeout(tempStopTimer);
+            clearTimeout(tempStabilizeDebounce);
+            clearTimeout(permDebounceTimer);
         }
 
-        // restart (stop then start)
-        async function restart() {
-            const settings = ruleManager.getSettings();
-
-            // ⛔ Abort if script is disabled
-            if (settings?.deletionSettings?.scriptDisabled) {
-                console.warn("[WebAssassin] Script disabled — restart aborted.");
-                return;
-            }
-
+        function restart() {
             stop();
-            await Promise.resolve(); // yield
             start();
         }
 
-
-        // alias
-        function refresh() { return restart(); }
-
-        // external hook registration for delete events
-        const deleteListeners = new Set();
-        function onDeleted(cb) {
-            if (typeof cb !== "function") return () => { };
-            deleteListeners.add(cb);
-            return () => deleteListeners.delete(cb);
-        }
-
-        // internal wrapper to call registered callbacks (also dispatches global event already in handleDeletionCounts)
-        function notifyDeletedCallbacks(detail) {
-            for (const cb of deleteListeners) {
-                try { cb(detail); } catch (e) { }
-            }
-        }
-
-        // We attach to DOM-level event the engine emits already in handleDeletionCounts,
-        // but also provide programmatic hook:
-        window.addEventListener("web-assassin:elements-deleted", (e) => {
-            notifyDeletedCallbacks(e.detail);
-        });
-
-        function isRunning() { return running; }
-
-        // public API
-        return {
-            start,
-            stop,
-            restart,
-            refresh,
-            onDeleted,
-            isRunning
-        };
+        return { start, stop, restart };
     }
+
 
     // ----------------------
     // UI core: shadow root, factory helpers, and components
@@ -1389,458 +1302,613 @@
 
         function buildStyles() {
             const t = themeVars();
+
             return `
-/* Ensure host and core containers use the chosen UI font */
-:host { all: initial; font-family: ${t.font}; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale; }
-.wa-root, .wa-panel, .wa-header, .wa-title, .wa-card, .wa-main, .wa-sidebar, .wa-content, .wa-editor-window {
-    font-family: ${t.font};
-}
-/* Apply to controls and text-bearing elements explicitly to avoid UA fallback */
-.wa-btn, button, input, textarea, select, .wa-input, .wa-toggle, .wa-small, .wa-rule-meta, .wa-tab, .wa-title, .wa-editor-id {
-    font-family: ${t.font};
+/* -------------------------------------------------------
+   Base / Font Reset
+------------------------------------------------------- */
+:host {
+  all: initial;
+  font-family: ${t.font};
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-/* Custom scrollbar for all UI elements */
+.wa-root,
+.wa-panel,
+.wa-header,
+.wa-title,
+.wa-card,
+.wa-main,
+.wa-sidebar,
+.wa-content,
+.wa-editor-window {
+  font-family: ${t.font};
+}
+
+/* Controls + Explicit Font Targets */
+.wa-btn,
+button,
+input,
+textarea,
+select,
+.wa-input,
+.wa-toggle,
+.wa-small,
+.wa-rule-meta,
+.wa-tab,
+.wa-title,
+.wa-editor-id {
+  font-family: ${t.font};
+}
+
+/* -------------------------------------------------------
+   Scrollbars
+------------------------------------------------------- */
 .wa-root * {
-    scrollbar-width: thin;
-    scrollbar-color: ${t.accent} transparent;
+  scrollbar-width: thin;
+  scrollbar-color: ${t.accent} transparent;
 }
+
 .wa-root *::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
+  width: 8px;
+  height: 8px;
 }
+
 .wa-root *::-webkit-scrollbar-track {
-    background: transparent;
+  background: transparent;
 }
+
 .wa-root *::-webkit-scrollbar-thumb {
-    background: ${t.accent};
-    border-radius: 4px;
-    transition: background-color 0.2s ease;
+  background: ${t.accent};
+  border-radius: 4px;
+  transition: background-color 0.2s ease;
 }
+
 .wa-root *::-webkit-scrollbar-thumb:hover {
-    background: ${t.accent}CC;
+  background: ${t.accent}CC;
 }
 
-.wa-root { position: fixed; z-index: 2147483647; pointer-events: none; }
-/* Floating icon */
+/* Root container */
+.wa-root {
+  position: fixed;
+  z-index: 2147483647;
+  pointer-events: none;
+}
+
+/* -------------------------------------------------------
+   Floating Action Button
+------------------------------------------------------- */
 .web-assassin-fab {
-    position: fixed;
-    width: 52px;
-    height: 52px;
-    bottom: 24px;
-    right: 24px;
-    border-radius: 16px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    cursor: grab;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
-    background: linear-gradient(135deg, ${t.accent}, ${t.accent}CC);
-    color: white;
-    font-weight: 600;
-    font-size: 20px;
-    pointer-events: auto;
-    transition: all 0.2s ease;
-    backdrop-filter: blur(12px);
-    border: 1px solid ${t.border};
+  position: fixed;
+  width: 52px;
+  height: 52px;
+  bottom: 24px;
+  right: 24px;
+  border-radius: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: grab;
+  pointer-events: auto;
+  font-weight: 600;
+  font-size: 20px;
+
+  color: white;
+  background: linear-gradient(135deg, ${t.accent}, ${t.accent}CC);
+  border: 1px solid ${t.border};
+  box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+
+  transition: all 0.2s ease;
+  backdrop-filter: blur(12px);
 }
+
 .web-assassin-fab:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 12px 32px rgba(0,0,0,0.2);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 32px rgba(0,0,0,0.2);
 }
+
 .web-assassin-fab:active {
-    cursor: grabbing;
-    transform: scale(0.95);
+  cursor: grabbing;
+  transform: scale(0.95);
 }
 
-/* Panel window (draggable + resizable) */
+/* -------------------------------------------------------
+   Panel Window
+------------------------------------------------------- */
 .web-assassin-panel {
-    position: fixed;
-    width: 760px;
-    height: 560px;
-    min-width: 400px;
-    min-height: 320px;
-    bottom: 100px;
-    right: 24px;
-    pointer-events: auto;
-    background: ${t.background};
-    color: ${t.foreground};
-    border: 0px solid ${t.border};
-    border-radius: 20px;
-    box-shadow: 0 20px 60px rgba(0,0,0,0.2), 0 0 0 1px ${t.border};
-    display: none;
-    overflow: hidden;
-    resize: none;
-    backdrop-filter: blur(20px);
+  position: fixed;
+  width: 760px;
+  height: 560px;
+  min-width: 400px;
+  min-height: 320px;
+
+  bottom: 100px;
+  right: 24px;
+
+  display: none;
+  pointer-events: auto;
+
+  background: ${t.background};
+  color: ${t.foreground};
+  border-radius: 20px;
+  border: 0 solid ${t.border};
+  box-shadow:
+    0 20px 60px rgba(0,0,0,0.2),
+    0 0 0 1px ${t.border};
+
+  overflow: hidden;
+  resize: none;
+  backdrop-filter: blur(20px);
 }
+
 .web-assassin-panel.show {
-    display: block;
-    animation: wa-panel-appear 0.3s ease-out;
+  display: block;
+  animation: wa-panel-appear 0.3s ease-out;
 }
+
 @keyframes wa-panel-appear {
-    from { opacity: 0; transform: translateY(20px) scale(0.98); }
-    to { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(20px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0)    scale(1); }
 }
 
+/* -------------------------------------------------------
+   Panel Header / Layout
+------------------------------------------------------- */
 .wa-header {
-    height: 20px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    padding: 16px 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
 
-    /* Darkened gradient */
-    background: linear-gradient(
-        180deg,
-        color-mix(in srgb, ${t.accent} 60%, black 40%),
-        color-mix(in srgb, ${t.accent} 20%, black 80%)
-    );
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, ${t.accent} 60%, black 40%),
+    color-mix(in srgb, ${t.accent} 20%, black 80%)
+  );
 
-    border-bottom: 1px solid ${t.border};
-    cursor: grab;
-    border-radius: 20px 20px 0 0;
+  border-bottom: 1px solid ${t.border};
+  border-radius: 20px 20px 0 0;
+  cursor: grab;
 }
 
 .wa-title {
-    font-weight: 600;
-    font-size: 16px;
-    letter-spacing: -0.02em;
-    color: #e6eef8;
+  font-weight: 600;
+  font-size: 16px;
+  letter-spacing: -0.02em;
+  color: #e6eef8;
 }
+
 .wa-toolbar {
-    margin-left: auto;
-    display: flex;
-    gap: 10px;
-    align-items: center;
+  margin-left: auto;
+  display: flex;
+  gap: 10px;
+  align-items: center;
 }
+
 .wa-content {
-    display: flex;
-    height: calc(100% - 60px);
-    background: ${t.background};
+  display: flex;
+  height: calc(100% - 60px);
+  background: ${t.background};
 }
 
 .wa-sidebar {
-    width: 180px;
-    border-right: 1px solid ${t.border};
-    padding: 16px;
-    box-sizing: border-box;
-    overflow: auto;
-    background: ${t.background2};
-    backdrop-filter: blur(10px);
+  width: 180px;
+  border-right: 1px solid ${t.border};
+  padding: 16px;
+  overflow: auto;
+
+  box-sizing: border-box;
+  background: ${t.background2};
+  backdrop-filter: blur(10px);
 }
+
 .wa-main {
-    flex: 1;
-    padding: 16px;
-    overflow: auto;
-    background: ${t.background};
+  flex: 1;
+  padding: 16px;
+  overflow: auto;
+  background: ${t.background};
 }
 
+/* -------------------------------------------------------
+   Tabs
+------------------------------------------------------- */
 .wa-tab {
-    display: block;
-    padding: 12px 14px;
-    margin-bottom: 8px;
-    border-radius: 12px;
-    cursor: pointer;
-    font-weight: 500;
-    transition: all 0.2s ease;
-    border: 1px solid transparent;
+  display: block;
+  padding: 12px 14px;
+  margin-bottom: 8px;
+  border-radius: 12px;
+
+  cursor: pointer;
+  font-weight: 500;
+
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
 }
+
 .wa-tab:hover {
-    background: ${t.background3};
+  background: ${t.background3};
 }
+
 .wa-tab.active {
-    background: ${t.accent};
-    color: white;
-    border-color: ${t.accent};
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  background: ${t.accent};
+  color: white;
+  border-color: ${t.accent};
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
 }
 
+/* -------------------------------------------------------
+   Cards
+------------------------------------------------------- */
 .wa-card {
-    background: ${t.background2};
-    border: 1px solid ${t.border};
-    padding: 16px;
-    border-radius: 16px;
-    margin-bottom: 16px;
-    transition: all 0.2s ease;
-    backdrop-filter: blur(8px);
+  background: ${t.background2};
+  border: 1px solid ${t.border};
+  padding: 16px;
+  border-radius: 16px;
+  margin-bottom: 16px;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(8px);
 }
+
 .wa-card:hover {
-    border-color: ${t.accent}80;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+  border-color: ${t.accent}80;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08);
 }
 
+/* -------------------------------------------------------
+   Buttons
+------------------------------------------------------- */
 .wa-btn {
-    padding: 10px 16px;
-    border-radius: 12px;
-    border: 1px solid ${t.border};
-    cursor: pointer;
-    background: ${t.background3};
-    font-weight: 500;
-    transition: all 0.2s ease;
-    color: ${t.foreground}; /* Change text color based on mode */
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid ${t.border};
+  cursor: pointer;
+
+  background: ${t.background3};
+  color: ${t.foreground};
+  font-weight: 500;
+  transition: all 0.2s ease;
 }
+
 .wa-btn:hover {
-    background: ${t.background3}CC;
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+  background: ${t.background3}CC;
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
 }
+
 .wa-btn.primary {
-    background: ${t.accent};
-    color: white;
-    border-color: transparent;
+  background: ${t.accent};
+  color: white;
+  border-color: transparent;
 }
+
 .wa-btn.primary:hover {
-    background: ${t.accent}CC;
-    box-shadow: 0 6px 16px rgba(0,0,0,0.15);
+  background: ${t.accent}CC;
+  box-shadow: 0 6px 16px rgba(0,0,0,0.15);
 }
+
 .wa-btn.small {
-    padding: 6px 12px;
-    font-size: 13px;
+  padding: 6px 12px;
+  font-size: 13px;
 }
 
+/* -------------------------------------------------------
+   Toggle
+------------------------------------------------------- */
 .wa-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    cursor: pointer;
-    padding: 8px;
-    border-radius: 8px;
-    transition: all 0.2s ease;
-}
-.wa-toggle:hover {
-    background: ${t.background3};
-}
-.wa-toggle .toggle-switch {
-    width: 44px;
-    height: 24px;
-    background: ${t.background3};
-    border-radius: 12px;
-    position: relative;
-    transition: all 0.2s ease;
-}
-.wa-toggle .toggle-switch::after {
-    content: '';
-    position: absolute;
-    width: 20px;
-    height: 20px;
-    border-radius: 10px;
-    background: ${t.foreground};
-    top: 2px;
-    left: 2px;
-    transition: all 0.2s ease;
-}
-.wa-toggle.checked .toggle-switch {
-    background: ${t.accent};
-}
-.wa-toggle.checked .toggle-switch::after {
-    left: 22px;
-    background: white;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  padding: 8px;
+  border-radius: 8px;
+  transition: all 0.2s ease;
 }
 
+.wa-toggle:hover {
+  background: ${t.background3};
+}
+
+.wa-toggle .toggle-switch {
+  width: 44px;
+  height: 24px;
+  background: ${t.background3};
+  border-radius: 12px;
+  position: relative;
+  transition: all 0.2s ease;
+}
+
+.wa-toggle .toggle-switch::after {
+  content: '';
+  position: absolute;
+  width: 20px;
+  height: 20px;
+  top: 2px;
+  left: 2px;
+
+  background: ${t.foreground};
+  border-radius: 10px;
+  transition: all 0.2s ease;
+}
+
+.wa-toggle.checked .toggle-switch {
+  background: ${t.accent};
+}
+
+.wa-toggle.checked .toggle-switch::after {
+  left: 22px;
+  background: white;
+}
+
+/* -------------------------------------------------------
+   Lists & Rule Cards
+------------------------------------------------------- */
 .wa-list {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
 .wa-rule-card {
-    border: 1px solid ${t.border};
-    padding: 14px;
-    border-radius: 14px;
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    justify-content: space-between;
-    background: ${t.background2};
-    transition: all 0.2s ease;
-    border: 1px solid ${t.border};
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+
+  background: ${t.background2};
+  padding: 14px;
+  border-radius: 14px;
+
+  border: 1px solid ${t.border};
+  transition: all 0.2s ease;
 }
+
 .wa-rule-card:hover {
-    border-color: ${t.accent}80;
-    box-shadow: 0 4px 16px rgba(0,0,0,0.08);
-    transform: translateY(-1px);
+  border-color: ${t.accent}80;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.08);
+  transform: translateY(-1px);
 }
+
 .wa-rule-meta {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
 }
+
 .wa-small {
-    font-size: 13px;
-    opacity: 0.7;
-    font-weight: 400;
+  font-size: 13px;
+  opacity: 0.7;
 }
 
+/* -------------------------------------------------------
+   Editor Modal
+------------------------------------------------------- */
 .wa-editor-modal {
-    position: fixed;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: rgba(0,0,0,0.5);
-    backdrop-filter: blur(12px);
-    z-index: 2147483650;
-    pointer-events: auto;
+  position: fixed;
+  inset: 0;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  background: rgba(0,0,0,0.5);
+  backdrop-filter: blur(12px);
+
+  z-index: 2147483650;
+  pointer-events: auto;
 }
+
 .wa-editor-window {
-    width: 800px;
-    max-width: calc(100% - 48px);
-    max-height: calc(100% - 48px);
-    background: ${t.background};
-    color: ${t.foreground};
-    border-radius: 20px;
-    border: 1px solid ${t.border};
-    box-shadow: 0 30px 80px rgba(0,0,0,0.3);
-    overflow: auto;
-    padding: 20px;
-    animation: wa-modal-appear 0.3s ease-out;
+  width: 800px;
+  max-width: calc(100% - 48px);
+  max-height: calc(100% - 48px);
+
+  background: ${t.background};
+  color: ${t.foreground};
+
+  padding: 20px;
+  overflow: auto;
+
+  border: 1px solid ${t.border};
+  border-radius: 20px;
+  box-shadow: 0 30px 80px rgba(0,0,0,0.3);
+
+  animation: wa-modal-appear 0.3s ease-out;
 }
+
 @keyframes wa-modal-appear {
-    from { opacity: 0; transform: scale(0.95); }
-    to { opacity: 1; transform: scale(1); }
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
 }
+
 .wa-editor-header {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 16px;
-    padding-bottom: 16px;
-    border-bottom: 1px solid ${t.border};
+  display: flex;
+  align-items: center;
+  gap: 12px;
+
+  margin-bottom: 16px;
+  padding-bottom: 16px;
+
+  border-bottom: 1px solid ${t.border};
 }
+
 .wa-form-row {
-    display: flex;
-    gap: 12px;
-    margin-bottom: 16px;
-    align-items: center;
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+  align-items: center;
 }
-.wa-input, textarea {
-    width: 100%;
-    padding: 12px 14px;
-    border-radius: 12px;
-    border: 1px solid ${t.border};
-    background: ${t.background2};
-    color: ${t.foreground};
-    box-sizing: border-box;
-    font-family: ${t.font};
-    transition: all 0.2s ease;
-    border: 1px solid ${t.border};
+
+/* Inputs */
+.wa-input,
+textarea {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid ${t.border};
+  background: ${t.background2};
+  color: ${t.foreground};
+
+  font-family: ${t.font};
+  transition: all 0.2s ease;
+  box-sizing: border-box;
 }
-.wa-input:focus, textarea:focus {
-    outline: none;
-    border-color: ${t.accent};
-    box-shadow: 0 0 0 2px ${t.accent}40;
+
+.wa-input:focus,
+textarea:focus {
+  outline: none;
+  border-color: ${t.accent};
+  box-shadow: 0 0 0 2px ${t.accent}40;
 }
+
 .wa-selector-item {
-    display: flex;
-    gap: 12px;
-    align-items: center;
-    padding: 12px;
-    background: ${t.background2};
-    border-radius: 12px;
-    border: 1px solid ${t.border};
-    transition: all 0.2s ease;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+
+  padding: 12px;
+  background: ${t.background2};
+  border-radius: 12px;
+
+  border: 1px solid ${t.border};
+  transition: all 0.2s ease;
 }
+
 .wa-selector-item:hover {
-    border-color: ${t.accent}80;
+  border-color: ${t.accent}80;
 }
+
+/* Resize Grip */
 .wa-resize-grip {
-    position: absolute;
-    width: 20px;
-    height: 20px;
-    right: 8px;
-    bottom: 8px;
-    cursor: se-resize;
-    background: linear-gradient(135deg, ${t.background3}, ${t.background2});
-    border-radius: 4px;
-    border: 1px solid ${t.border};
-    transition: all 0.2s ease;
+  position: absolute;
+  width: 20px;
+  height: 20px;
+
+  right: 8px;
+  bottom: 8px;
+
+  cursor: se-resize;
+
+  background: linear-gradient(135deg, ${t.background3}, ${t.background2});
+  border-radius: 4px;
+  border: 1px solid ${t.border};
+  transition: all 0.2s ease;
 }
+
 .wa-resize-grip:hover {
-    background: linear-gradient(135deg, ${t.accent}, ${t.accent}80);
-    border-color: ${t.accent};
+  background: linear-gradient(135deg, ${t.accent}, ${t.accent}80);
+  border-color: ${t.accent};
 }
 
+/* Footer */
 .wa-footer {
-    display: flex;
-    gap: 12px;
-    margin-top: 20px;
-    justify-content: flex-end;
-    padding-top: 16px;
-    border-top: 1px solid ${t.border};
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+
+  margin-top: 20px;
+  padding-top: 16px;
+
+  border-top: 1px solid ${t.border};
 }
 
+/* -------------------------------------------------------
+   Toasts
+------------------------------------------------------- */
 .wa-toast-wrap {
-    position: fixed;
-    right: 32px;
-    bottom: 110px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    z-index: 2147483655;
-    pointer-events: none;
+  position: fixed;
+  right: 32px;
+  bottom: 110px;
+
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+
+  pointer-events: none;
+  z-index: 2147483655;
 }
+
 .wa-toast {
-    pointer-events: auto;
-    padding: 14px 18px;
-    border-radius: 12px;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.15);
-    color: white;
-    font-family: ${t.font};
-    backdrop-filter: blur(12px);
-    border: 1px solid rgba(255,255,255,0.1);
-    animation: wa-toast-appear 0.3s ease-out;
+  pointer-events: auto;
+
+  padding: 14px 18px;
+  border-radius: 12px;
+
+  color: white;
+  font-family: ${t.font};
+
+  border: 1px solid rgba(255,255,255,0.1);
+  box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+
+  backdrop-filter: blur(12px);
+  animation: wa-toast-appear 0.3s ease-out;
 }
+
 @keyframes wa-toast-appear {
-    from { opacity: 0; transform: translateX(100%); }
-    to { opacity: 1; transform: translateX(0); }
+  from { opacity: 0; transform: translateX(100%); }
+  to   { opacity: 1; transform: translateX(0); }
 }
+
 .wa-toast.success {
-    background: linear-gradient(135deg, #16a34a, #22c55e);
+  background: linear-gradient(135deg, #16a34a, #22c55e);
 }
+
 .wa-toast.error {
-    background: linear-gradient(135deg, #dc2626, #ef4444);
+  background: linear-gradient(135deg, #dc2626, #ef4444);
 }
 
 .wa-confirm {
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
-/* Stats and metrics styling */
+/* -------------------------------------------------------
+   Stats & Metrics
+------------------------------------------------------- */
 .wa-stats-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-    gap: 16px;
-    margin: 16px 0;
-}
-.wa-stat-card {
-    background: ${t.background2};
-    padding: 16px;
-    border-radius: 12px;
-    text-align: center;
-    border: 1px solid ${t.border};
-}
-.wa-stat-value {
-    font-size: 24px;
-    font-weight: 600;
-    color: ${t.accent};
-    margin-bottom: 4px;
-}
-.wa-stat-label {
-    font-size: 13px;
-    opacity: 0.7;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 16px;
+  margin: 16px 0;
 }
 
-/* Ensure the editor id element (display-only) uses the same font */
+.wa-stat-card {
+  background: ${t.background2};
+  padding: 16px;
+  border-radius: 12px;
+  text-align: center;
+  border: 1px solid ${t.border};
+}
+
+.wa-stat-value {
+  font-size: 24px;
+  font-weight: 600;
+  color: ${t.accent};
+  margin-bottom: 4px;
+}
+
+.wa-stat-label {
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+/* Editor ID and Tables */
 #wa-editor-id {
-    font-family: ${t.font};
-    font-size: 13px;
-    opacity: 0.7;
+  font-family: ${t.font};
+  font-size: 13px;
+  opacity: 0.7;
+}
+
+.wa-main .wa-card #wa-stats-table,
+.wa-main .wa-card #wa-stats-table * {
+  color: ${t.foreground};
 }
 `;
         }
+
 
         style.textContent = buildStyles();
         shadow.appendChild(style);

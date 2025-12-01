@@ -14,6 +14,7 @@
 // @grant        GM.info
 // @grant        GM_registerMenuCommand
 // @grant        GM.addValueChangeListener
+// @require     https://cdn.jsdelivr.net/npm/css-selector-generator@3.7.0/build/index.js
 // ==/UserScript==
 
 (() => {
@@ -83,6 +84,7 @@
     };
 
     const GM_KEY = "web_assassin_settings";
+    // window.__webAssassinDeletionEvents + window.__webAssassinDeletionTotals globals for deletion events
 
     // ----------------------
     // GM storage wrappers (fall back to localStorage for dev/testing)
@@ -352,57 +354,18 @@
     }
 
     function generateCssSelector(el) {
-        // Robust, but simple generator:
-        // - If element has ID and it's unique in document -> use #id
-        // - else build path with tag + classes and nth-of-type as necessary
-        if (!el || el.nodeType !== 1) return "";
-        const doc = document;
-        if (el.id) {
-            const query = `#${CSS.escape(el.id)}`;
-            try {
-                const found = doc.querySelectorAll(query);
-                if (found.length === 1) return query;
-            } catch (e) {
-                // ignore
-            }
-        }
+        if (!el || el.nodeType !== 1) return "";  // Return empty if the element is invalid
 
-        // build path of up to 5 segments
-        const parts = [];
-        let node = el;
-        for (let depth = 0; node && node.nodeType === 1 && depth < 6; depth++, node = node.parentElement) {
-            let part = node.tagName.toLowerCase();
-            if (node.classList && node.classList.length) {
-                // take only first two classes to keep selector readable
-                const cls = Array.from(node.classList).slice(0, 2).map((c) => "." + CSS.escape(c)).join("");
-                part += cls;
-            }
-            // nth-of-type fallback for uniqueness
-            try {
-                const siblings = node.parentElement ? Array.from(node.parentElement.children).filter((c) => c.tagName === node.tagName) : [];
-                if (siblings.length > 1) {
-                    const idx = siblings.indexOf(node) + 1;
-                    part += `:nth-of-type(${idx})`;
-                }
-            } catch (e) { }
-            parts.unshift(part);
-            try {
-                const sel = parts.join(" > ");
-                if (doc.querySelectorAll(sel).length === 1) return sel;
-            } catch (e) { }
-        }
-        // fallback to tag.class path
         try {
-            const fallback = parts.join(" > ");
-            if (fallback) return fallback;
-        } catch (e) { }
-        // ultimate fallback
-        try {
-            return el.tagName.toLowerCase();
+            // Use the correct namespace and method to generate the selector
+            return CssSelectorGenerator.getCssSelector(el);
         } catch (e) {
-            return "";
+            console.error("Error generating selector for element:", el, e);
+            // Fallback to a simple selector if the library fails
+            return el.tagName.toLowerCase();
         }
     }
+
 
     // ----------------------
     // Rule management core (isolated module)
@@ -808,9 +771,7 @@
     function DeletionEngine(ruleManager) {
         if (!ruleManager) throw new Error("DeletionEngine requires a ruleManager instance");
 
-        // -------------------------------------------------------------
-        // Internal State
-        // -------------------------------------------------------------
+        // ---- Globals & state ----
         let running = false;
         let permObserver = null;
         let urlObserversInstalled = false;
@@ -820,19 +781,92 @@
         let tempStopTimer = null;
         let tempStabilizeDebounce = null;
         let permDebounceTimer = null;
+        let urlChangeDebounce = null;
 
-        // selector → Set(ruleIDs)
+        // cleanup handle for permanent observer (close-over)
+        let cleanupPermanent = null;
+
+        // selector maps (string -> Set(ruleId))
         let tempSelectorMap = new Map();
         let permSelectorMap = new Map();
 
         const doc = document;
-
-        // -------------------------------------------------------------
-        // Helpers (fast-path)
-        // -------------------------------------------------------------
         const now = () => Date.now();
-        const normSel = (sel) => normalizeSelectorString(sel || "");
+        const normSel = (sel) => (typeof normalizeSelectorString === "function") ? normalizeSelectorString(sel || "") : (sel || "");
 
+        // ---- Globals for UI (readable by lazy-loaded UI) ----
+        // Keep a capped list of recent deletion events and aggregate totals
+        try {
+            if (!window.__webAssassinDeletionEvents) {
+                // keep as simple array of {ts, ruleID, deletionType, count, frameId}
+                window.__webAssassinDeletionEvents = [];
+            }
+            if (!window.__webAssassinDeletionTotals) {
+                // shape: { permanent: { [ruleId]: n }, temp: { [ruleId]: n } }
+                window.__webAssassinDeletionTotals = { permanent: {}, temp: {} };
+            }
+        } catch (e) {
+            // `window` may be restricted in some environments; ignore if not writable.
+        }
+        const EVENTS_CAP = 200; // max kept events (bounded)
+
+        // ---- Helpers to emit & record deletions ----
+        function recordGlobalDeletion(ruleId, type, count) {
+            try {
+                // record totals
+                const totals = window.__webAssassinDeletionTotals;
+                if (totals) {
+                    const bucket = type === "permanent" ? totals.permanent : totals.temp;
+                    if (!bucket[ruleId]) bucket[ruleId] = 0;
+                    bucket[ruleId] += count;
+                }
+
+                // push event into capped array
+                const arr = window.__webAssassinDeletionEvents;
+                if (arr) {
+                    arr.push({
+                        ts: Date.now(),
+                        ruleID: ruleId,
+                        deletionType: type,
+                        count,
+                        // helpful to know which frame produced it
+                        frameLocation: (typeof location !== "undefined" && location.href) ? location.href : null
+                    });
+                    if (arr.length > EVENTS_CAP) arr.splice(0, arr.length - EVENTS_CAP);
+                }
+            } catch (e) {
+                // best-effort; do not let recording errors break deletion flow
+            }
+        }
+
+        // ---- Keep original handleDeletionCounts semantics, but emit also global records ----
+        function handleDeletionCounts(countMap, type) {
+            const s = ruleManager.getSettings();
+            if (!s?.statsEnabled) return;
+
+            for (const [ruleId, count] of countMap.entries()) {
+                // original behavior: increment counters in ruleManager
+                ruleManager.incrementCounter(
+                    ruleId,
+                    type === "permanent" ? "permanent" : "temp",
+                    count
+                );
+
+                // dispatch the original CustomEvent so existing listeners continue to work
+                try {
+                    window.dispatchEvent(
+                        new CustomEvent("web-assassin:elements-deleted", {
+                            detail: { ruleID: ruleId, deletionType: type, count }
+                        })
+                    );
+                } catch (e) { /* ignore dispatch errors */ }
+
+                // new: record into the two global caps so UI can read on lazy load
+                recordGlobalDeletion(ruleId, type === "permanent" ? "permanent" : "temp", count);
+            }
+        }
+
+        // ---- aggregation logic (kept semantically the same) ----
         function addToSelectorMap(map, selector, ruleID) {
             if (!selector) return;
             let set = map.get(selector);
@@ -845,10 +879,8 @@
             return s?.deletionSettings || {};
         }
 
-        // -------------------------------------------------------------
-        // Aggregation of Selectors
-        // -------------------------------------------------------------
         function aggregateSelectorsForCurrentPage() {
+            // Clear maps and re-populate based on current ruleManager settings
             tempSelectorMap.clear();
             permSelectorMap.clear();
 
@@ -880,31 +912,7 @@
             };
         }
 
-        // -------------------------------------------------------------
-        // Stats & Event Dispatch
-        // -------------------------------------------------------------
-        function handleDeletionCounts(countMap, type) {
-            const s = ruleManager.getSettings();
-            if (!s?.statsEnabled) return;
-
-            for (const [ruleId, count] of countMap.entries()) {
-                ruleManager.incrementCounter(
-                    ruleId,
-                    type === "permanent" ? "permanent" : "temp",
-                    count
-                );
-
-                window.dispatchEvent(
-                    new CustomEvent("web-assassin:elements-deleted", {
-                        detail: { ruleID: ruleId, deletionType: type, count }
-                    })
-                );
-            }
-        }
-
-        // -------------------------------------------------------------
-        // TEMPORARY PASS
-        // -------------------------------------------------------------
+        // ---- Temporary deletion behavior (kept equivalent) ----
         function runTemporaryDeletion(selectors) {
             if (!selectors || selectors.length === 0)
                 return Promise.resolve({ totalDeleted: 0, perRuleCounts: new Map() });
@@ -918,6 +926,7 @@
             );
             const stabilizeMs = Math.max(150, Math.floor((minMs + maxMs) / 6));
 
+            // Map selector -> Set(ruleIds)
             const selectorToRules = new Map();
             for (const [sel, set] of tempSelectorMap.entries()) {
                 selectorToRules.set(sel, new Set(set));
@@ -932,7 +941,7 @@
                     try {
                         nodeList = doc.querySelectorAll(sel);
                     } catch {
-                        continue; // invalid selector
+                        continue; // invalid selector - skip
                     }
 
                     for (const el of nodeList) {
@@ -956,8 +965,11 @@
 
             return new Promise((resolve) => {
                 let done = false;
+
+                // Initial pass
                 scan();
 
+                // MutationObserver with debounce -> Stable Debounce (Option A)
                 const mo = new MutationObserver(() => {
                     clearTimeout(tempStabilizeDebounce);
                     tempStabilizeDebounce = setTimeout(scan, mutationDebounce);
@@ -968,7 +980,7 @@
                 } catch {
                     try {
                         mo.observe(doc.body, { childList: true, subtree: true });
-                    } catch { }
+                    } catch { /* if we can't observe, rely on initial scan and timeout */ }
                 }
 
                 function finish() {
@@ -982,46 +994,50 @@
                 }
 
                 tempStabilizeDebounce = setTimeout(finish, stabilizeMs);
+                // Hard stop to bound runtime
                 tempStopTimer = setTimeout(finish, maxMs);
             });
         }
 
-        // -------------------------------------------------------------
-        // PERMANENT PASS
-        // -------------------------------------------------------------
+        // ---- Permanent observer: stable debounce (Option A) ----
         function startPermanentObserver(selectors) {
             const cfg = getDeletionConfig();
+            // Use a single debounce window for batches (stable behavior)
             const debounceMs = Math.max(
                 50,
                 Number(cfg.peridoicURLMutationDebounce || cfg.mutationObserverDebounceInterval || 250)
             );
 
+            // Map selector -> Set(ruleIds)
             const selectorToRules = new Map();
             for (const [sel, set] of permSelectorMap.entries()) {
                 selectorToRules.set(sel, new Set(set));
             }
 
+            // We'll collect added nodes into a Set to avoid duplicates
             let queue = new Set();
 
+            // Processing function (batched)
             function process() {
                 if (!queue.size) return;
-
                 const nodes = [...queue];
                 queue.clear();
 
                 const removed = new Set();
                 const ruleCounts = new Map();
 
+                // For each node, examine it and its subtree for selector matches
                 for (const node of nodes) {
                     if (!node) continue;
 
-                    const roots = node.nodeType === 1 ? [node] : [];
+                    // If the node itself is an Element, consider it as a root for matches as well
+                    const roots = (node.nodeType === 1) ? [node] : [];
 
                     for (const sel of selectors) {
                         let ruleIds = selectorToRules.get(sel);
                         if (!ruleIds) continue;
 
-                        // Check root
+                        // Check root nodes for matches (use try/catch for invalid selectors)
                         for (const root of roots) {
                             try {
                                 if (root.matches?.(sel)) {
@@ -1034,17 +1050,16 @@
                                             ruleCounts.set(id, (ruleCounts.get(id) || 0) + 1);
                                     }
                                 }
-                            } catch { }
+                            } catch { /* invalid selector in matches - skip */ }
                         }
 
-                        // Query children
+                        // Then check descendants
                         let matches;
                         try {
                             matches = node.querySelectorAll?.(sel);
                         } catch {
                             continue;
                         }
-
                         if (!matches) continue;
 
                         for (const m of matches) {
@@ -1059,17 +1074,25 @@
                     }
                 }
 
-                handleDeletionCounts(ruleCounts, "permanent");
+                // Report counts via original mechanism
+                try {
+                    handleDeletionCounts(ruleCounts, "permanent");
+                } catch (e) { /* swallow any errors to keep observer robust */ }
             }
 
+            // Schedule processing with stable debounce
             function schedule() {
                 clearTimeout(permDebounceTimer);
                 permDebounceTimer = setTimeout(process, debounceMs);
             }
 
+            // Install MutationObserver
             permObserver = new MutationObserver((mutations) => {
+                // Add addedNodes to the queue; don't process here
                 for (const m of mutations) {
-                    for (const n of m.addedNodes) queue.add(n);
+                    for (const n of m.addedNodes) {
+                        queue.add(n);
+                    }
                 }
                 schedule();
             });
@@ -1080,24 +1103,29 @@
                 try { permObserver.observe(doc.body, { childList: true, subtree: true }); } catch { }
             }
 
+            // Run an initial sweep with the document root to catch existing matches
+            try {
+                queue.add(doc.documentElement);
+                process();
+            } catch { /* ignore errors */ }
+
+            // Return cleanup function
             return () => {
                 try { permObserver.disconnect(); } catch { }
-                clearTimeout(permDebounceTimer);
                 permObserver = null;
+                clearTimeout(permDebounceTimer);
+                permDebounceTimer = null;
             };
         }
 
-        // -------------------------------------------------------------
-        // URL Change Handling
-        // -------------------------------------------------------------
-        let urlChangeDebounce = null;
-
+        // ---- URL change detection (kept behavior; stable debounce) ----
         function scheduleUrlChange() {
             clearTimeout(urlChangeDebounce);
             urlChangeDebounce = setTimeout(() => {
                 const newUrl = location.href;
                 if (newUrl !== lastUrl) {
                     lastUrl = newUrl;
+                    // call local restart; higher-level code (top) is responsible for broadcasting global restarts
                     restart();
                 }
             }, 120);
@@ -1144,11 +1172,12 @@
                 clearInterval(periodicUrlTimer);
                 periodicUrlTimer = null;
             }
+
+            // Attempt to restore original history methods? We don't attempt restore to avoid race conditions;
+            // navigation observers are idempotent across restarts in this per-frame design.
         }
 
-        // -------------------------------------------------------------
-        // Engine Core
-        // -------------------------------------------------------------
+        // ---- Start / Stop / Restart API ----
         async function start() {
             if (running) return;
             running = true;
@@ -1157,17 +1186,19 @@
             const cfg = getDeletionConfig();
             if (cfg.scriptDisabled) return;
 
+            // Collect all rule definitions once per start (fast check)
             const rules = ruleManager.getAllRules() || [];
             const pageURL = location.href;
-
             const matchesAny =
                 rules.some(r => r?.ruleEnabled !== false && domainMatches(r.domain, pageURL));
 
+            // If no rules apply, still install URL observers to detect future navigation
             if (!matchesAny) {
                 installUrlObservers();
                 return;
             }
 
+            // Aggregate selectors for this page
             const { tempSelectors, permSelectors } = aggregateSelectorsForCurrentPage();
 
             if ((!tempSelectors.length) && (!permSelectors.length)) {
@@ -1175,35 +1206,48 @@
                 return;
             }
 
+            // Run temporary deletion (initial sweep)
             try {
                 await runTemporaryDeletion(tempSelectors);
-            } catch { }
+            } catch { /* ignore temporary deletion errors */ }
 
+            // Start persistent observer for permanent selectors
             const stopPerm = startPermanentObserver(permSelectors);
-
-            installUrlObservers();
-
-            // Handed to restart()
             cleanupPermanent = stopPerm;
-        }
 
-        let cleanupPermanent = null;
+            // Install URL observers so frame navigations restart this frame engine
+            installUrlObservers();
+        }
 
         function stop() {
             running = false;
-            cleanupPermanent?.();
+            // Stop permanent observer
+            try { cleanupPermanent?.(); } catch { }
             cleanupPermanent = null;
+
+            // Clear timers & debounces
             clearTimeout(tempStopTimer);
             clearTimeout(tempStabilizeDebounce);
             clearTimeout(permDebounceTimer);
+            clearTimeout(urlChangeDebounce);
+
+            // Uninstall url observers
+            uninstallUrlObservers();
         }
 
         function restart() {
             stop();
+            // start should be called asynchronously to allow previous cleanup to settle
+            // but keep same semantics as original (start immediately)
             start();
         }
 
-        return { start, stop, restart };
+        // Expose external lifecycle and a small introspection for debugging
+        return {
+            start,
+            stop,
+            restart,
+        };
     }
 
 
@@ -1211,6 +1255,12 @@
     // UI core: shadow root, factory helpers, and components
     // ----------------------
     async function initUI() {
+        try {
+            if (window.top !== window) return null;
+        } catch (e) {
+            // cross-origin access denied -> treat as non-top => no UI here
+            return null;
+        }
         // Try to obtain the shared RuleManager and Engine from window.
         // If they're not present yet, wait briefly for the bootstrap to set them.
         // If still missing after waiting, create fallback instances from persisted settings.
@@ -2035,6 +2085,7 @@ textarea:focus {
             lastDrag.fabDragging = true;
             lastDrag.x = ev.clientX; lastDrag.y = ev.clientY;
             fab.style.transition = "none";
+            fab.style.transform = "none"; // Disable hover/active transform while dragging
             ev.preventDefault();
         });
         document.addEventListener("mousemove", (ev) => {
@@ -2123,6 +2174,7 @@ textarea:focus {
             if (lastDrag.fabDragging) {
                 lastDrag.fabDragging = false;
                 fab.style.transition = "";
+                fab.style.transform = ""; // Restore CSS transform after dragging
                 saveUIPos({ right: fab.style.right, bottom: fab.style.bottom });
             }
             if (lastDrag.panelDragging) {
@@ -2409,23 +2461,29 @@ textarea:focus {
             const s = getSettings();
             const container = document.createElement("div");
 
-            const card1 = document.createElement("div"); card1.className = "wa-card";
-            const totalDeleted = (ruleManager.getAllRules() || []).reduce((acc, r) => acc + (Number(r.tempDeleteCount || 0) + Number(r.permanentDeleteCount || 0)), 0);
+            // First Card: Stats Toggle & Reset Button
+            const card1 = document.createElement("div");
+            card1.className = "wa-card";
+
+            const totalDeletedTemp = (ruleManager.getAllRules() || []).reduce((acc, r) => acc + (Number(r.tempDeleteCount || 0)), 0);
+            const totalDeletedPerm = (ruleManager.getAllRules() || []).reduce((acc, r) => acc + (Number(r.permanentDeleteCount || 0)), 0);
+
             card1.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;">
-        <div>
-          <div style="font-weight:700">Statistics</div>
-          <div class="wa-small">Enable/disable stats collection</div>
+        <div style="display:flex;align-items:center;justify-content:space-between;">
+            <div>
+                <div style="font-weight:700">Statistics</div>
+                <div class="wa-small">Enable/disable stats collection</div>
+            </div>
+            <div>
+                <label class="wa-toggle">
+                    <input type="checkbox" id="wa-stats-toggle" ${s.statsEnabled ? "checked" : ""}/>
+                    <span class="wa-small">${s.statsEnabled ? "On" : "Off"}</span>
+                </label>
+            </div>
         </div>
-        <div>
-          <label class="wa-toggle">
-            <input type="checkbox" id="wa-stats-toggle" ${s.statsEnabled ? "checked" : ""}/>
-            <span class="wa-small">${s.statsEnabled ? "On" : "Off"}</span>
-          </label>
-        </div>
-      </div>
-      <div style="margin-top:8px;">Total deletions (all rules): <strong>${totalDeleted}</strong></div>
-      <div style="margin-top:8px;"><button class="wa-btn" id="wa-reset-counters">Reset all counters</button></div>
+        <div style="margin-top:8px;">Total deletions (temporary): <strong>${totalDeletedTemp}</strong></div>
+        <div style="margin-top:8px;">Total deletions (permanent): <strong>${totalDeletedPerm}</strong></div>
+        <div style="margin-top:8px;"><button class="wa-btn" id="wa-reset-counters">Reset all counters</button></div>
     `;
             container.appendChild(card1);
 
@@ -2436,6 +2494,7 @@ textarea:focus {
                 ruleManager.setSettings(st);
                 toast(`Stats ${newVal ? "enabled" : "disabled"}`, "success");
             });
+
             qS(card1, "#wa-reset-counters").addEventListener("click", async () => {
                 const ok = await confirmDialog("Reset counters", "Reset all deletion counters to zero?");
                 if (!ok) return;
@@ -2447,19 +2506,34 @@ textarea:focus {
                 renderStatsTab();
             });
 
-            // Table of rules and counts
-            const card2 = document.createElement("div"); card2.className = "wa-card";
+            // Second Card: Stats Table
+            const card2 = document.createElement("div");
+            card2.className = "wa-card";
             card2.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Per-rule counts</div><div id="wa-stats-table"></div>`;
             container.appendChild(card2);
 
             const table = document.createElement("table");
             table.style.width = "100%";
-            table.innerHTML = `<thead><tr><th style="text-align:left">Name</th><th style="text-align:left">Domain</th><th style="text-align:right">Deletions</th></tr></thead>`;
+            table.innerHTML = `
+        <thead>
+            <tr>
+                <th style="text-align:left">Name</th>
+                <th style="text-align:left">Domain</th>
+                <th style="text-align:right">Temporary</th>
+                <th style="text-align:right">Permanent</th>
+            </tr>
+        </thead>`;
+
             const tbody = document.createElement("tbody");
             const all = ruleManager.getAllRules() || [];
             for (const r of all) {
                 const tr = document.createElement("tr");
-                tr.innerHTML = `<td>${r.name || ""}</td><td class="wa-small">${r.domain || ""}</td><td style="text-align:right">${(Number(r.tempDeleteCount || 0) + Number(r.permanentDeleteCount || 0))}</td>`;
+                tr.innerHTML = `
+            <td>${r.name || ""}</td>
+            <td class="wa-small">${r.domain || ""}</td>
+            <td style="text-align:right">${Number(r.tempDeleteCount || 0)}</td>
+            <td style="text-align:right">${Number(r.permanentDeleteCount || 0)}</td>
+        `;
                 tbody.appendChild(tr);
             }
             table.appendChild(tbody);
@@ -3241,67 +3315,125 @@ textarea:focus {
             openEditor,
         };
     }
-    // ----------------------
-    // CONTENT SCRIPT BOOTSTRAP — ALWAYS START ENGINE BEFORE UI
-    // ----------------------
+    // -----------------------------------------------------------
+    // SAFE CONTENT SCRIPT BOOTSTRAP — SINGLETON ENGINE + MANAGER
+    // -----------------------------------------------------------
     (async () => {
-        // Load settings
+        // Every frame must initialize its own engine.
+        // Remove the old singleton guards based on window.*
+
+        // Load settings (shared through GM storage)
         let saved = await gmGet(GM_KEY, null);
         if (!saved) {
             saved = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
             await gmSet(GM_KEY, saved);
         }
 
-        // Create rule manager (SHARED with UI)
+        // Local per-frame manager + engine
         const ruleManager = RuleManager(saved);
-        window.webAssassinRuleManager = ruleManager;
-
-        // Create engine and attach to window
         const deletionEngine = DeletionEngine(ruleManager);
-        window.webAssassinEngine = deletionEngine;
 
+        // Start engine for this frame
         if (!saved.scriptDisabled) {
             deletionEngine.start();
         }
 
-        window.addEventListener("web-assassin:refresh-engine", () => {
-            deletionEngine.restart?.();
+        // Listen for global restart events (from top window)
+        window.addEventListener("web-assassin:global-restart", () => {
+            deletionEngine.restart();
         });
     })();
 
 
-    // expose initUI to window and initialize immediately
-    window.webAssassinInitUI = initUI;
-    // Lazy UI bootstrap: create a lightweight global FAB that initializes the full shadow-root UI on first click.
-    (function createLiteFab() {
-        if (document.getElementById("web-assassin-fab-lite")) return;
-        const lite = document.createElement("div");
-        lite.id = "web-assassin-fab-lite";
-        lite.className = "web-assassin-fab-lite";
-        lite.title = "Web Assassin";
-        lite.textContent = "WA";
-        // inline styles so the lite FAB looks usable before the shadow UI exists
-        lite.style.cssText = 'position:fixed; width:56px; height:56px; bottom:18px; right:18px; border-radius:50%; display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:0 6px 18px rgba(0,0,0,0.25); background:#0078d4; color:white; font-weight:700; z-index:2147483647; pointer-events:auto;';
-        document.documentElement.appendChild(lite);
 
-        async function onClickOnce(ev) {
-            try {
-                // initialize full UI (which creates its own shadow-root FAB/panel)
-                const ui = await initUI();
-                window.webAssassinUI = ui;
-                // remove lite FAB
-                try { lite.remove(); } catch (e) { }
-                // show the panel because user clicked the icon
-                try { ui.showPanel && ui.showPanel(); } catch (e) { }
-                console.info("Web Assassin UI initialized (lazy).");
-            } catch (err) {
-                console.error("Failed to initialize Web Assassin UI (lazy)", err);
-            } finally {
-                lite.removeEventListener("click", onClickOnce);
-            }
+    // -----------------------------------------------------------
+    // UI BOOTSTRAP — SINGLETON UI + SINGLETON LAZY FAB
+    // -----------------------------------------------------------
+    window.webAssassinInitUI = initUI;
+
+    (function createLiteFab() {
+        try {
+            if (window.top !== window) return;
+        } catch (e) {
+            return;
         }
 
-        lite.addEventListener("click", onClickOnce);
+        if (window.__webAssassinUIBootstrapped) return;
+        window.__webAssassinUIBootstrapped = true;
+
+        // Flag that becomes true only when the user clicks the FAB
+        window.__waFabClicked = false;
+
+        function createFab() {
+            if (document.getElementById("web-assassin-fab-lite")) return;
+
+            const lite = document.createElement("div");
+            lite.id = "web-assassin-fab-lite";
+            lite.className = "web-assassin-fab-lite";
+            lite.title = "Web Assassin";
+            lite.textContent = "WA";
+            lite.style.cssText =
+                'position:fixed; width:56px; height:56px; bottom:18px; right:18px; ' +
+                'border-radius:50%; display:flex; align-items:center; justify-content:center; ' +
+                'cursor:pointer; box-shadow:0 6px 18px rgba(0,0,0,0.25); ' +
+                'background:#0078d4; color:white; font-weight:700; z-index:2147483647; pointer-events:auto;';
+
+            const parent = document.body || document.documentElement;
+            parent.appendChild(lite);
+
+            async function onClickOnce(ev) {
+                // Mark that the FAB is intentionally removed
+                window.__waFabClicked = true;
+
+                try {
+                    if (!window.webAssassinUI) {
+                        window.webAssassinUI = await initUI();
+                    }
+                    lite.remove();
+                    window.webAssassinUI?.showPanel?.();
+                } catch (err) {
+                    console.error("Failed to initialize Web Assassin UI (lazy)", err);
+                }
+
+                lite.removeEventListener("click", onClickOnce);
+            }
+
+            lite.addEventListener("click", onClickOnce);
+        }
+
+        // Create the FAB initially
+        createFab();
+
+        // Protect against unwanted removal/hiding until clicked
+        const observer = new MutationObserver(() => {
+            // After click: STOP PROTECTING
+            if (window.__waFabClicked) return;
+
+            const fab = document.getElementById("web-assassin-fab-lite");
+
+            // If removed without a click → recreate it
+            if (!fab) {
+                createFab();
+                return;
+            }
+
+            // If hidden by CSS → restore visibility
+            const cs = getComputedStyle(fab);
+            if (cs.display === "none" || cs.visibility === "hidden" || cs.opacity === "0") {
+                fab.style.display = "flex";
+                fab.style.visibility = "visible";
+                fab.style.opacity = "1";
+            }
+        });
+
+        observer.observe(document.documentElement, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ["style", "class"]
+        });
     })();
+
+
     // End of IIFE
 })();

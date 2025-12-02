@@ -205,5 +205,3 @@ Includes:
 It does not negotiate.  
 It does not hesitate.  
 It eliminates—cleanly, quickly, and permanently.
-
----

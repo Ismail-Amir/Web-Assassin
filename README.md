@@ -87,7 +87,7 @@ Choose one:
 ## 2. Install Web Assassin
 1. Open your userscript manager.  
 2. Click **Create New Script** or **Add Script**.  
-3. Paste the full contents of `Web Assassin.js`.  
+3. Paste the full contents of `web_assassin.js`.  
 4. Save & enable the script.
 
 ---

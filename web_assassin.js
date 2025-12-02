@@ -2343,8 +2343,8 @@ textarea:focus {
             cardStatus.innerHTML = `
     <div style="display:flex;align-items:center;justify-content:space-between;">
       <div>
-        <div style="font-weight:700">Script</div>
-        <div class="wa-small">Enable or disable deletion engine</div>
+        <div style="font-weight:700">Kill status</div>
+        <div class="wa-small">Enable or disable elements deletion</div>
       </div>
       <div>
         <label class="wa-toggle">
@@ -2436,7 +2436,7 @@ textarea:focus {
             // Rule list card
             const listCard = document.createElement("div");
             listCard.className = "wa-card";
-            listCard.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Rules</div><div id="wa-rules-list" class="wa-list"></div>`;
+            listCard.innerHTML = `<div style="font-weight:700;margin-bottom:8px">Saved Rules</div><div id="wa-rules-list" class="wa-list"></div>`;
             container.appendChild(listCard);
 
             mainPane.appendChild(container);
@@ -2608,7 +2608,7 @@ textarea:focus {
       <div style="margin-top:8px;">
         <label class="wa-toggle">
           <input type="checkbox" id="wa-settings-toasts" ${s.toastsEnabled ? "checked" : ""}/>
-          <span class="wa-small">Toasts Enabled</span>
+          <span class="wa-small">Notifications</span>
         </label>
       </div>
     `;

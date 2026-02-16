@@ -2889,9 +2889,15 @@ textarea:focus {
                     <div style="font-weight:700">${mode === "add" ? "Add Rule" : "Edit Rule"}</div>
                 </div>
                 <div style="display:flex;gap:12px;flex-direction:column;">
-                    <div class="wa-form-row"><input class="wa-input" id="wa-editor-name" placeholder="Rule name" /></div>
-                    <div class="wa-form-row"><input class="wa-input" id="wa-editor-domain" placeholder="Domain (e.g. example.com)" /></div>
+                    <div class="wa-form-row" style="display:flex;align-items:center;gap:8px;">
+                        <label for="wa-editor-name" style="min-width:100px;font-weight:600;">Rule Name</label>
+                        <input class="wa-input" id="wa-editor-name" placeholder="Set a custom name to remember this rule later, e.g. Clean xyz.com" style="flex:1;" />
+                    </div>
 
+                    <div class="wa-form-row" style="display:flex;align-items:center;gap:8px;">
+                        <label for="wa-editor-domain" style="min-width:100px;font-weight:600;">Website</label>
+                        <input class="wa-input" id="wa-editor-domain" placeholder="Domain (e.g. example.com)" style="flex:1;" />
+                    </div>
                     <div>
                         <div style="font-weight:700">Selectors</div>
                         <div id="wa-editor-selectors" style="margin-top:8px;"></div>
